@@ -1,0 +1,125 @@
+# ===========================================================================
+# AutoPortalAuth 配置文件
+# ---------------------------------------------------------------------------
+# 所有相对路径都相对于“本配置文件所在目录”解析。
+# 任何一项都可以删掉，程序会自动使用内置默认值（见 auto_portal_auth.py
+# 里的 DEFAULT_CONFIG）。程序在启动时读取一次配置，修改后请重启程序生效。
+# ===========================================================================
+
+app:
+  log_level: INFO                 # DEBUG / INFO / WARNING / ERROR
+  log_file: logs/auto_portal_auth.log
+  log_max_bytes: 2097152          # 单个日志文件 2MB，超过即滚动
+  log_backup_count: 5             # 保留 5 个历史日志
+  stats_file: data/stats.json
+  state_file: data/state.json     # 当前状态快照，供其它程序/脚本读取
+  lock_file: data/auto_portal_auth.lock
+  single_instance: true           # 只允许一个实例运行
+  hide_console: true              # 自启时使用 pythonw.exe / VBS 隐藏黑框
+
+detect:
+  connect_timeout: 3              # TCP 连接超时（秒）
+  read_timeout: 5                 # 读取超时（秒）
+  ignore_system_proxy: true       # 忽略系统代理，保证能看见 Portal 重定向
+  user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+
+  # “能否上网”的判定目标。规则：
+  #   - 期望 HTTP 状态码一致，且响应中包含 expect_contains 关键字 -> 判定为“正常”；
+  #   - 出现 3xx 重定向、状态码不符、内容不符 -> 判定为“被 Portal 拦截”。
+  # 只要有一个目标通过就认为网络正常。国内校园网环境建议保留 msft / miui。
+  probe_targets:
+    - name: msft
+      url: "http://www.msftconnecttest.com/connecttest.txt"
+      expect_status: 200
+      expect_contains: "Microsoft Connect Test"
+    - name: miui
+      url: "http://connect.rom.miui.com/generate_204"
+      expect_status: 204
+      expect_contains: ""
+    - name: gstatic
+      url: "http://connectivitycheck.gstatic.com/generate_204"
+      expect_status: 204
+      expect_contains: ""
+    # 需要 HTTPS 探测时可加（部分 Portal 不劫持 HTTPS，判定会更保守）：
+    # - name: https_gstatic
+    #   url: "https://connectivitycheck.gstatic.com/generate_204"
+    #   expect_status: 204
+    #   expect_contains: ""
+
+  portal_max_hops: 5              # 跟随重定向抓取认证页真实地址的最大跳数
+  probe_portal_page: true         # 抓取认证页正文用于厂商指纹识别
+  probe_portal_page_max_bytes: 262144
+
+network:
+  # 判定“物理链路已连接”时忽略的网卡（子串匹配，不分大小写）
+  ignore_interfaces:
+    - loopback
+    - virtualbox
+    - vmware
+    - hyper-v
+    - vethernet
+    - docker
+    - veth
+    - tap
+    - tun
+    - bluetooth
+    - teredo
+    - isatap
+    - wsl
+    - npcap
+    - wan miniport
+
+monitor:
+  interval: 30                    # 网络正常时的巡检周期
+  portal_interval: 8              # 需要认证时的重试周期（失败会指数退避）
+  link_down_interval: 5           # 链路断开/无 IP 时的巡检周期
+  unknown_interval: 15            # 状态未知时的巡检周期
+  wake_grace: 3                   # 唤醒后等待网卡就绪的秒数
+  wake_fast_probes: 12            # 唤醒后快速探测的次数（尽快恢复）
+  backoff_max: 300                # 认证失败时的最大退避周期
+  detect_sleep_skew: 5.0          # 时钟差值超过该值即判定发生过休眠
+
+auth:
+  enabled: true
+  open_browser: true              # 打开默认浏览器访问认证页（多数 Portal 必需）
+  http_probe_portal: true         # 先主动 GET 认证页（部分 Portal 以此建立会话）
+  browser_cooldown: 90            # 同一认证页重复打开浏览器的最小间隔
+  trigger_commands: []            # 自定义触发命令，例如：
+                                  # trigger_commands:
+                                  #   - ["C:/tools/campus_login.exe", "--url", "{portal_url}"]
+
+  # ---- 自动填表登录（可选，配置账号密码后即可全自动）--------------------
+  auto_login:
+    enabled: false               # 改成 true 并填好账号密码即可静默登录
+    username: ""
+    password: ""
+    extra_fields: {}              # 例如 {"ac_id": "1", "nasip": "10.0.0.1"}
+    username_field_keywords: ["user", "name", "account", "acct", "login", "sid", "uid"]
+    password_field_keywords: ["pass", "pwd", "password", "secret"]
+    verify_timeout: 25            # 提交后等待联网成功的最大秒数
+
+  # ---- 心跳保活：定期发小请求，避免会话被空闲超时清理 --------------------
+  keepalive:
+    enabled: true
+    interval: 0                   # 0 = 自动（依据统计到的空闲超时推算）；也可手填秒数
+    default_interval: 240         # 自动推算样本不足时使用的默认值
+
+notification:
+  enabled: true
+  on_success: true                # 网络恢复时提醒
+  on_failure: true                # 连续失败达到阈值时提醒
+  on_wake: false                  # 唤醒事件是否提醒（默认关，避免打扰）
+  cooldown: 60                    # 同类通知的最小间隔
+  failure_threshold: 3            # 连续认证失败多少次才提醒
+  native_windows: true            # Windows 使用 PowerShell 托盘气泡通知
+
+stats:
+  enabled: true
+  max_sessions: 500               # 最多保留多少条会话记录
+  max_idle_samples: 200           # 最多保留多少条空闲超时样本
+
+timeout_analysis:
+  enabled: true
+  min_samples: 3                  # 至少多少个样本才给保活建议
+  min_seconds: 60                 # 小于该时长不算“空闲超时”（可能只是抖动）
+  max_seconds: 43200              # 大于该时长也不算（12 小时）

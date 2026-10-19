@@ -1,0 +1,25 @@
+{
+  "state": "internet_ok",
+  "detail": "探测通过: msft (72 ms)",
+  "interface": "以太网",
+  "local_ip": "59.79.4.243",
+  "portal_url": "",
+  "fingerprint": null,
+  "probes": [
+    {
+      "target": "msft",
+      "kind": "ok",
+      "status": 200,
+      "final_url": "http://www.msftconnecttest.com/connecttest.txt",
+      "elapsed_ms": 72,
+      "detail": "HTTP 200 OK"
+    }
+  ],
+  "checked_at": "2026-10-19T16:44:13",
+  "version": "1.0.0",
+  "pid": 32436,
+  "session_seconds": 602.8,
+  "last_ok": "2026-10-19T16:44:13",
+  "fail_streak": 0,
+  "keepalive_interval": 240.0
+}

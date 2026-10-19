@@ -1,0 +1,38 @@
+2026-10-19 16:33:39 [INFO   ] portal: 网络正常: 探测通过: msft (136 ms)
+2026-10-19 16:34:08 [INFO   ] portal: 安装开机自启（方式=startup）: C:\Users\14976\AppData\Local\Programs\Python\Python312\pythonw.exe -X utf8 D:\auto_portal_auth\auto_portal_auth.py run
+2026-10-19 16:34:08 [INFO   ] portal: 已创建启动脚本: C:\Users\14976\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup\AutoPortalAuth.vbs
+2026-10-19 16:34:08 [INFO   ] portal: 已启动后台进程
+2026-10-19 16:34:10 [INFO   ] portal: ====================================================================
+2026-10-19 16:34:10 [INFO   ] portal: AutoPortalAuth v1.0.0 启动 平台=Windows Python=3.12.10
+2026-10-19 16:34:10 [INFO   ] portal: 配置文件: D:\auto_portal_auth\config.yaml
+2026-10-19 16:34:10 [INFO   ] portal: 巡检周期: 正常 30s / 待认证 8s / 掉线 5s
+2026-10-19 16:34:10 [INFO   ] portal: 自动登录: 关 | 浏览器触发: 开 | 保活: 开
+2026-10-19 16:34:10 [INFO   ] portal: ====================================================================
+2026-10-19 16:34:10 [DEBUG  ] portal: Windows 电源事件监听已启动 (hwnd=18614540)
+2026-10-19 16:34:10 [DEBUG  ] portal: 状态=internet_ok 详情=探测通过: msft (148 ms)
+2026-10-19 16:34:10 [INFO   ] portal: 网络恢复
+2026-10-19 16:34:10 [INFO   ] portal: 通知: AutoPortalAuth 网络已恢复 - 自动认证成功，网络可用
+2026-10-19 16:34:10 [INFO   ] portal: 保活间隔设为 240.0s
+2026-10-19 16:34:10 [DEBUG  ] portal: 保活心跳: HTTP 200 (ok)
+2026-10-19 16:34:40 [DEBUG  ] portal: 状态=internet_ok 详情=探测通过: msft (74 ms)
+2026-10-19 16:35:10 [DEBUG  ] portal: 状态=internet_ok 详情=探测通过: msft (70 ms)
+2026-10-19 16:35:40 [DEBUG  ] portal: 状态=internet_ok 详情=探测通过: msft (71 ms)
+2026-10-19 16:36:10 [DEBUG  ] portal: 状态=internet_ok 详情=探测通过: msft (77 ms)
+2026-10-19 16:36:41 [DEBUG  ] portal: 状态=internet_ok 详情=探测通过: msft (72 ms)
+2026-10-19 16:37:11 [DEBUG  ] portal: 状态=internet_ok 详情=探测通过: msft (137 ms)
+2026-10-19 16:37:41 [DEBUG  ] portal: 状态=internet_ok 详情=探测通过: msft (74 ms)
+2026-10-19 16:38:11 [DEBUG  ] portal: 状态=internet_ok 详情=探测通过: msft (73 ms)
+2026-10-19 16:38:11 [DEBUG  ] portal: 保活心跳: HTTP 200 (ok)
+2026-10-19 16:38:41 [DEBUG  ] portal: 状态=internet_ok 详情=探测通过: msft (121 ms)
+2026-10-19 16:39:11 [DEBUG  ] portal: 状态=internet_ok 详情=探测通过: msft (66 ms)
+2026-10-19 16:39:41 [DEBUG  ] portal: 状态=internet_ok 详情=探测通过: msft (71 ms)
+2026-10-19 16:40:12 [DEBUG  ] portal: 状态=internet_ok 详情=探测通过: msft (94 ms)
+2026-10-19 16:40:42 [DEBUG  ] portal: 状态=internet_ok 详情=探测通过: msft (71 ms)
+2026-10-19 16:41:12 [DEBUG  ] portal: 状态=internet_ok 详情=探测通过: msft (85 ms)
+2026-10-19 16:41:42 [DEBUG  ] portal: 状态=internet_ok 详情=探测通过: msft (69 ms)
+2026-10-19 16:42:12 [DEBUG  ] portal: 状态=internet_ok 详情=探测通过: msft (70 ms)
+2026-10-19 16:42:12 [DEBUG  ] portal: 保活心跳: HTTP 200 (ok)
+2026-10-19 16:42:42 [DEBUG  ] portal: 状态=internet_ok 详情=探测通过: msft (68 ms)
+2026-10-19 16:43:12 [DEBUG  ] portal: 状态=internet_ok 详情=探测通过: msft (69 ms)
+2026-10-19 16:43:43 [DEBUG  ] portal: 状态=internet_ok 详情=探测通过: msft (79 ms)
+2026-10-19 16:44:13 [DEBUG  ] portal: 状态=internet_ok 详情=探测通过: msft (72 ms)
