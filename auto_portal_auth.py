@@ -84,6 +84,12 @@ try:
 except ImportError:  # pragma: no cover
     psutil = None
 
+# 自动点击引擎（可选组件：缺 selenium 时模块仍可导入，只是不可用）
+try:
+    import portal_autoclick
+except Exception:  # pragma: no cover
+    portal_autoclick = None
+
 
 __version__ = "1.0.0"
 APP_NAME = "AutoPortalAuth"
@@ -192,6 +198,40 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "on_wake": False,       # 唤醒事件是否提醒
         "cooldown": 60,
         "failure_threshold": 3,  # 连续失败多少次才提醒
+    },
+    # -------------------------------------------------------------------
+    # 浏览器自动化：自动勾选条款 + 点击"连接/登录"按钮（Selenium）
+    # 这是解决"页面已打开但还要人工点一下"的核心模块。
+    # -------------------------------------------------------------------
+    "browser_automation": {
+        "enabled": True,
+        "engine": "auto",              # auto | selenium | off
+        "browser": "auto",             # auto | edge | chrome
+        "binary": "",                  # 自定义浏览器可执行文件路径（留空自动查找）
+        "headless": "auto",            # auto=先无头，失败再显示窗口 | true | false
+        "timeout": 35,                 # 一次点击+验证的总预算（秒）
+        "page_load_timeout": 20,
+        "verify_interval": 3,          # 轮询"是否已联网"的间隔
+        "click_delay": 0.8,            # 点击后等待页面反应
+        "settle_seconds": 1.5,         # 打开页面后等待渲染
+        "max_attempts": 2,             # 同一浏览器会话内最多点击几轮
+        "max_frame_depth": 3,          # iframe 递归深度
+        "profile_dir": "data/browser_profile",   # 专用浏览器配置（保留记住的登录态）
+        "no_proxy": True,              # 认证页必须直连
+        "ignore_cert_errors": True,    # Portal 常见自签证书
+        "keep_browser_open": False,    # 成功后是否保留浏览器窗口
+        "dump_on_failure": True,       # 失败时保存 HTML/截图，便于调参
+        "screenshot_on_failure": True,
+        "dump_dir": "data/autoclick",
+        "score_threshold": 5,          # 低于该分数宁可不点，避免乱点
+        "skip_terms_checkbox": False,  # true = 不自动勾选服务条款
+        "accept_alerts": True,         # 自动确认 alert/confirm
+        "failure_threshold": 3,        # 连续失败几次后暂时停用
+        "failure_cooldown": 600,       # 停用时长（秒）
+        "button_texts": [],            # 追加"连接"类关键词（权重 9）
+        "button_deny_texts": [],       # 追加"不要点"的关键词
+        "checkbox_texts": [],          # 追加条款复选框关键词
+        "extra_button_selectors": [],  # 追加 CSS 选择器
     },
     "stats": {
         "enabled": True,
@@ -311,6 +351,10 @@ def setup_logging(cfg: Config, verbose: bool = False, level_override: Optional[s
 
     root = logging.getLogger()
     root.setLevel(logging.DEBUG)
+    # 第三方库（尤其 Selenium）的 DEBUG 日志会把整个 WebDriver 报文打出来，
+    # 即使 -v 也会淹没我们自己的日志，因此统一压到 WARNING。
+    for noisy in ("selenium", "urllib3", "requests"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
     for handler in list(root.handlers):
         root.removeHandler(handler)
 
@@ -454,7 +498,7 @@ class _FormParser(HTMLParser):
                 method=(a.get("method", "post") or "post").lower(),
             )
             self.forms.append(self._current)
-        elif tag in ("input", "select", "textarea") and self._current is not None:
+        elif tag in ("input", "select", "textarea", "button") and self._current is not None:
             name = a.get("name") or a.get("id") or ""
             if not name:
                 return
@@ -462,6 +506,7 @@ class _FormParser(HTMLParser):
                 "name": name,
                 "type": (a.get("type") or tag).lower(),
                 "value": a.get("value", ""),
+                "checked": "checked" in a,
             })
 
     def handle_endtag(self, tag: str) -> None:
@@ -839,13 +884,94 @@ class NetworkChecker:
 # 6. 认证触发器（打开浏览器 / HTTP 戳 / 自动填表登录）
 # ===========================================================================
 class AuthTrigger:
-    def __init__(self, cfg: Config, checker: NetworkChecker):
+    def __init__(self, cfg: Config, checker: NetworkChecker, stats: Optional["StatsStore"] = None):
         self.cfg = cfg
         self.checker = checker
+        self.stats = stats
         self._last_browser_at: float = 0.0
         self._last_browser_url: str = ""
         self.attempts = 0
         self.successes = 0
+        # 自动点击（Selenium）
+        self.autoclicker = None
+        self._autoclick_init_failed = False
+        self._autoclick_fail_streak = 0
+        self._autoclick_disabled_until = 0.0
+
+    # ---- 自动点击引擎 -----------------------------------------------------
+    def _get_autoclicker(self):
+        if portal_autoclick is None or self._autoclick_init_failed:
+            return None
+        if not self.cfg.get("browser_automation.enabled", True):
+            return None
+        if str(self.cfg.get("browser_automation.engine", "auto")).lower() == "off":
+            return None
+        if self.autoclicker is None:
+            try:
+                self.autoclicker = portal_autoclick.PortalAutoClicker(self.cfg)
+            except Exception as exc:
+                LOG.warning("初始化自动点击引擎失败，将退回打开浏览器: %s", exc)
+                self._autoclick_init_failed = True
+                return None
+        return self.autoclicker
+
+    def selenium_click(self, status: NetStatus) -> bool:
+        """用浏览器自动化勾选条款并点击"连接/登录"，返回是否确认恢复联网。"""
+        if time.time() < self._autoclick_disabled_until:
+            return False
+        clicker = self._get_autoclicker()
+        if clicker is None:
+            return False
+        if not clicker.available:
+            reason = clicker.unavailable_reason()
+            if reason:
+                LOG.debug("自动点击不可用: %s", reason)
+            return False
+        if not status.portal_url:
+            return False
+
+        result = None
+        try:
+            result = clicker.click(
+                status.portal_url,
+                verify=lambda: self.checker.check().state is NetState.INTERNET_OK,
+            )
+        except Exception as exc:
+            LOG.warning("自动点击过程异常: %s", exc)
+
+        ok = bool(result and result.success)
+        if self.stats:
+            try:
+                self.stats.add_autoclick_result(ok)
+            except Exception:
+                pass
+
+        if ok:
+            self._autoclick_fail_streak = 0
+            LOG.info("自动点击完成认证：点击了「%s」，勾选 %d 项，用时 %.1fs",
+                     result.clicked_text, len(result.checkboxes or []), result.duration)
+            return True
+
+        # 失败：记录原因、递增退避
+        self._autoclick_fail_streak += 1
+        if result:
+            if result.clicked:
+                LOG.warning("已点击「%s」但未确认联网（可能需要人工确认或页面需要验证码）",
+                            result.clicked_text)
+            elif result.error:
+                LOG.warning("自动点击失败: %s", result.error)
+            if result.screenshot:
+                LOG.info("诊断截图: %s", result.screenshot)
+            if result.html_dump:
+                LOG.info("页面快照: %s", result.html_dump)
+        threshold = int(self.cfg.get("browser_automation.failure_threshold", 3))
+        if self._autoclick_fail_streak >= threshold:
+            cooldown = float(self.cfg.get("browser_automation.failure_cooldown", 600))
+            self._autoclick_disabled_until = time.time() + cooldown
+            self._autoclick_fail_streak = 0
+            LOG.warning("自动点击连续失败 %d 次，暂停 %.0f 秒（期间只用浏览器触发兜底）",
+                        threshold, cooldown)
+        return False
 
     # ---- 打开浏览器 -------------------------------------------------------
     def open_browser(self, portal_url: str, force: bool = False) -> bool:
@@ -899,6 +1025,8 @@ class AuthTrigger:
                 name = f.get("name", "")
                 low = name.lower()
                 ftype = (f.get("type") or "").lower()
+                if ftype in ("checkbox", "radio") and not f.get("checked"):
+                    continue          # 未勾选的复选框不要提交
                 if ftype == "password" or any(k in low for k in pwd_kw):
                     data[name] = pwd
                 elif any(k in low for k in user_kw):
@@ -906,6 +1034,12 @@ class AuthTrigger:
                 elif f.get("value"):
                     # 隐藏域（如 lt / execution / nasip）必须原样回传
                     data[name] = f["value"]
+
+            # 提交按钮的 name/value：不少 Portal 会校验"是哪个按钮提交的"，
+            # 漏掉它就会一直返回"请点击连接"。
+            for f in form.fields:
+                if (f.get("type") in ("submit", "button", "image")) and f.get("name"):
+                    data.setdefault(f["name"], f.get("value") or "")
 
         # 补上 URL 查询参数里的 Portal 协议字段（srun / ruijie 等常见要求）
         try:
@@ -936,6 +1070,13 @@ class AuthTrigger:
             target = urljoin(status.portal_url, form.action)
             method = form.method if form.method in ("get", "post") else "post"
         data = self._build_form_data(status.fingerprint, status.portal_url)
+
+        # 没有表单、也没有手工配置的 extra_fields 时，POST 到认证页本身没有意义
+        # （典型如 MAC 无感认证：页面上只有一个"连接"按钮）。
+        # 直接跳过，把机会留给后面的"自动点击"，避免白等 verify_timeout 秒。
+        if not (form and form.fields) and not (al.get("extra_fields") or {}):
+            LOG.debug("认证页没有可提交的表单，跳过 HTTP 自动登录（交给自动点击）")
+            return False
 
         LOG.info("尝试自动登录: %s %s（%d 个字段）", method.upper(), target, len(data))
         try:
@@ -989,10 +1130,16 @@ class AuthTrigger:
             except Exception as exc:
                 LOG.warning("自定义触发命令失败: %s", exc)
 
-        # 3) HTTP 戳一下认证页（很多 Portal 以此建立/刷新会话）
+        # 3) 方案 A：浏览器自动化 —— 自动勾选条款 + 点击"连接/登录"
+        #    这一步直接解决"浏览器打开了但按钮还要人手点"的问题。
+        if self.selenium_click(status):
+            self.successes += 1
+            return True
+
+        # 4) HTTP 戳一下认证页（很多 Portal 以此建立/刷新会话）
         self.poke_portal(portal_url)
 
-        # 4) 打开浏览器（让用户点一下，或页面的 JS 自动完成认证）
+        # 5) 最后兜底：打开浏览器（让用户点一下，或页面的 JS 自动完成认证）
         self.open_browser(portal_url, force=force_browser)
         return False
 
@@ -1229,6 +1376,8 @@ class StatsStore:
                 "auth_success": 0,
                 "auth_fail": 0,
                 "wake_events": 0,
+                "autoclick_attempts": 0,
+                "autoclick_success": 0,
             },
             "sessions": [],       # 最近 N 次在线会话
             "idle_timeouts": [],  # 观测到的空闲超时样本（秒）
@@ -1249,6 +1398,7 @@ class StatsStore:
             LOG.warning("读取统计文件失败(%s)，将重建: %s", self.path, exc)
 
     def save(self, force: bool = False) -> None:
+        """写盘。默认 5 秒限流；统计事件用 force=True，避免进程被结束时丢计数。"""
         if not self.enabled:
             return
         now = time.time()
@@ -1293,7 +1443,7 @@ class StatsStore:
             day = iso_from_ts(start_ts)[:10]
             daily = self.data["daily"].setdefault(day, {"online_seconds": 0, "disconnects": 0})
             daily["online_seconds"] = round(float(daily.get("online_seconds", 0)) + seconds, 1)
-        self.save()
+        self.save(force=True)
 
     def add_idle_timeout(self, seconds: float) -> None:
         if not self.enabled:
@@ -1304,7 +1454,7 @@ class StatsStore:
             if len(self.data["idle_timeouts"]) > max_samples:
                 self.data["idle_timeouts"] = self.data["idle_timeouts"][-max_samples:]
             self._bump("idle_timeouts")
-        self.save()
+        self.save(force=True)
 
     def add_disconnect(self) -> None:
         if not self.enabled:
@@ -1314,7 +1464,7 @@ class StatsStore:
             day = now_iso()[:10]
             daily = self.data["daily"].setdefault(day, {"online_seconds": 0, "disconnects": 0})
             daily["disconnects"] = int(daily.get("disconnects", 0)) + 1
-        self.save()
+        self.save(force=True)
 
     def add_auth_result(self, success: bool) -> None:
         if not self.enabled:
@@ -1322,14 +1472,24 @@ class StatsStore:
         with self._lock:
             self._bump("auth_attempts")
             self._bump("auth_success" if success else "auth_fail")
-        self.save()
+        self.save(force=True)
 
     def add_wake_event(self) -> None:
         if not self.enabled:
             return
         with self._lock:
             self._bump("wake_events")
-        self.save()
+        self.save(force=True)
+
+    def add_autoclick_result(self, success: bool) -> None:
+        """记录一次"自动点击"尝试（与 HTTP 自动登录分开统计）。"""
+        if not self.enabled:
+            return
+        with self._lock:
+            self._bump("autoclick_attempts")
+            if success:
+                self._bump("autoclick_success")
+        self.save(force=True)
 
     # ---- 分析 -------------------------------------------------------------
     def analyze_timeouts(self) -> Dict[str, Any]:
@@ -1551,8 +1711,8 @@ class AutoPortalAuth:
         self.cfg = cfg
         self.config_path = Path(config_path).resolve() if config_path else cfg.path
         self.checker = NetworkChecker(cfg)
-        self.trigger = AuthTrigger(cfg, self.checker)
         self.stats = StatsStore(cfg)
+        self.trigger = AuthTrigger(cfg, self.checker, self.stats)
         self.notifier = Notifier(cfg)
         self.watcher = WakeWatcher(
             expected_interval=float(cfg.get("monitor.interval", 30)),
@@ -1595,6 +1755,16 @@ class AutoPortalAuth:
                  "开" if self.cfg.get("auth.auto_login.enabled") else "关",
                  "开" if self.cfg.get("auth.open_browser") else "关",
                  "开" if self.cfg.get("auth.keepalive.enabled") else "关")
+        clicker = self.trigger._get_autoclicker()
+        if clicker is None:
+            LOG.info("自动点击: 关（可在 config.yaml -> browser_automation.enabled 开启）")
+        elif clicker.available:
+            key, exe = portal_autoclick.find_browser(self.cfg.get("browser_automation.browser", "auto"))
+            LOG.info("自动点击: 开（selenium %s, 浏览器=%s, headless=%s）",
+                     portal_autoclick.selenium_version(), key,
+                     self.cfg.get("browser_automation.headless"))
+        else:
+            LOG.warning("自动点击: 配置已开启但不可用 —— %s", clicker.unavailable_reason())
         LOG.info("=" * 68)
 
         # 启动时先跑一次，避免"开机后干等 30 秒"
@@ -1763,8 +1933,13 @@ class AutoPortalAuth:
             self.last_ok_ts = self.session_start
             self.after_wake = False
             self.stats.add_auth_result(True)
-            self.notifier.on_success(status, (self.session_start - prev_checked(prev)))
-            LOG.info("认证成功，网络已恢复")
+            # prev_checked() 在"首次启动、还没有历史时间戳"时会返回 None，
+            # 这里必须先判断，否则通知里的中断时长计算会抛 TypeError。
+            prev_ts = prev_checked(prev)
+            downtime = (self.session_start - prev_ts) if prev_ts else None
+            self.notifier.on_success(status, downtime)
+            LOG.info("认证成功，网络已恢复%s",
+                     f"（中断 {human_duration(downtime)}）" if downtime else "")
             return
 
         self._fail_streak += 1
@@ -2169,6 +2344,61 @@ def selftest() -> int:
     return 0 if failures == 0 else 1
 
 
+def cmd_install_extension() -> int:
+    """方案 C：把浏览器扩展装进 Edge/Chrome（需要用户手工确认一次）。"""
+    ext = Path(__file__).resolve().parent / "extension"
+    if not (ext / "manifest.json").exists():
+        LOG.error("找不到扩展目录或 manifest.json: %s", ext)
+        return 1
+
+    print(f"""
+浏览器扩展目录：
+    {ext}
+
+安装步骤（只需做一次）：
+    1. 浏览器会自动打开扩展管理页（没打开就手动输入下方地址）
+    2. 打开右上角「开发人员模式 / Developer mode」
+    3. 点击「加载解压缩的扩展 / Load unpacked」
+    4. 选择上面的目录
+    5. 之后认证页一打开，扩展会自动勾选条款并点击"连接"
+
+  扩展管理页地址：Edge -> edge://extensions    Chrome -> chrome://extensions
+""")
+
+    key, exe = "", ""
+    try:
+        if portal_autoclick is not None:
+            key, exe = portal_autoclick.find_browser("auto")
+    except Exception:
+        pass
+
+    page = "edge://extensions" if key == "edge" else "chrome://extensions"
+    try:
+        if exe:
+            subprocess.Popen([exe, page], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            LOG.info("已打开扩展管理页: %s", page)
+        else:
+            webbrowser.open(page)
+    except Exception as exc:
+        LOG.warning("无法自动打开扩展管理页（请手动打开 %s）: %s", page, exc)
+
+    try:
+        system = platform.system()
+        if system == "Windows":
+            opener = getattr(os, "startfile", None)
+            if opener:
+                opener(str(ext))
+        elif system == "Darwin":
+            subprocess.Popen(["open", str(ext)])
+        else:
+            subprocess.Popen(["xdg-open", str(ext)])
+        LOG.info("已在文件管理器中打开扩展目录")
+    except Exception as exc:
+        LOG.debug("打开目录失败: %s", exc)
+
+    return 0
+
+
 # ===========================================================================
 # 14. 工具函数
 # ===========================================================================
@@ -2251,6 +2481,26 @@ def build_parser() -> argparse.ArgumentParser:
     p_uninstall = sub.add_parser("uninstall", parents=[common], help="卸载开机自启")
     p_uninstall.add_argument("--method", default="auto", help="保留参数以兼容 install")
 
+    p_ac = sub.add_parser("autoclick", parents=[common],
+                          help="检测认证页并自动勾选+点击（方案 A）")
+    p_ac.add_argument("--url", help="认证页地址；省略则自动探测当前 Portal")
+    p_ac.add_argument("--explain", action="store_true",
+                      help="只打印候选元素的打分表，不点击（调参神器）")
+    p_ac.add_argument("--headed", action="store_true", help="使用可见浏览器窗口")
+    p_ac.add_argument("--keep-open", action="store_true", help="结束后不关闭浏览器")
+    p_ac.add_argument("--timeout", type=float, help="覆盖总超时（秒）")
+    p_ac.add_argument("--selector", action="append", default=[],
+                      help="追加 CSS 选择器（可多次指定），帮助定位特殊按钮")
+
+    p_drv = sub.add_parser("driver", parents=[common], help="检查/预下载浏览器驱动")
+    p_drv.add_argument("--browser", choices=["auto", "edge", "chrome"], default="auto")
+    p_drv.add_argument("--download", action="store_true",
+                       help="初始化一次驱动（首次需要联网下载）")
+    p_drv.add_argument("--headed", action="store_true", help="使用可见窗口测试")
+
+    sub.add_parser("install-extension", parents=[common],
+                   help="打开浏览器扩展管理页（方案 C）")
+
     return parser
 
 
@@ -2297,6 +2547,34 @@ def main(argv: Optional[List[str]] = None) -> int:
         LOG.info("卸载完成" if ok else "没有找到需要卸载的自启配置")
         return 0
 
+    if command == "driver":
+        if portal_autoclick is None:
+            LOG.error("找不到 portal_autoclick.py（请确认文件完整）")
+            return 1
+        if not portal_autoclick.selenium_available():
+            LOG.error("未安装 selenium，请执行: python -m pip install selenium")
+            return 1
+        if not args.download:
+            key, exe = portal_autoclick.find_browser(args.browser)
+            print(json.dumps({
+                "selenium": portal_autoclick.selenium_version(),
+                "browser": key or None,
+                "executable": exe or None,
+            }, ensure_ascii=False, indent=2))
+            if not key:
+                LOG.error("未找到 Edge / Chrome")
+                return 1
+            return 0
+        ok, msg = portal_autoclick.ensure_driver(cfg, args.browser,
+                                                 headless=not args.headed)
+        (LOG.info if ok else LOG.error)(msg)
+        if not ok:
+            LOG.info("提示：首次下载驱动需要能上网；可在能上网时先执行一次本命令。")
+        return 0 if ok else 1
+
+    if command == "install-extension":
+        return cmd_install_extension()
+
     # ---- 需要 AutoPortalAuth 实例的命令 ----------------------------------
     if command == "run" and getattr(args, "interval", None):
         cfg.set("monitor.interval", float(args.interval))
@@ -2307,7 +2585,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         status = app.checker.check()
         app.status = status
         app._write_state_file()
-        print(json.dumps(status.to_dict(), ensure_ascii=False, indent=2))
+        payload = status.to_dict()
+        payload["capabilities"] = {
+            "selenium": portal_autoclick.selenium_version() if portal_autoclick else "",
+            "browser": (portal_autoclick.find_browser(
+                cfg.get("browser_automation.browser", "auto"))[0] if portal_autoclick else ""),
+            "autoclick_enabled": bool(cfg.get("browser_automation.enabled", True)),
+            "extension_dir": str(Path(__file__).resolve().parent / "extension"),
+        }
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
         return 0
 
     if command == "stats":
@@ -2316,6 +2602,61 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if command == "once":
         return app.run_once(trigger_auth=not getattr(args, "no_trigger", False))
+
+    if command == "autoclick":
+        if portal_autoclick is None:
+            LOG.error("找不到 portal_autoclick.py（请确认文件完整）")
+            return 1
+        if not portal_autoclick.selenium_available():
+            LOG.error("未安装 selenium，请执行: python -m pip install selenium")
+            return 1
+        for sel in (getattr(args, "selector", None) or []):
+            cfg.set("browser_automation.extra_button_selectors",
+                    list(cfg.get("browser_automation.extra_button_selectors") or []) + [sel])
+        if getattr(args, "timeout", None):
+            cfg.set("browser_automation.timeout", float(args.timeout))
+
+        clicker = portal_autoclick.PortalAutoClicker(cfg)
+        if not clicker.available:
+            LOG.error("自动点击不可用: %s", clicker.unavailable_reason())
+            return 1
+
+        url = getattr(args, "url", None)
+        if not url:
+            status = app.checker.check()
+            LOG.info("当前状态: %s（%s）", status.state.value, status.detail)
+            url = status.portal_url
+            if not url:
+                print("当前网络正常或未发现认证页，无需点击。")
+                return 0
+            LOG.info("使用探测到的认证页: %s", url)
+
+        if getattr(args, "explain", False):
+            rows = clicker.explain(url, headless=not getattr(args, "headed", False))
+            if not rows:
+                print("没有采集到任何可点击元素（页面可能未加载完或需要登录）")
+                return 1
+            print(f"{'分数':>7}  {'点击':<4} {'frame':<10} {'元素':<10} 文本 / 属性")
+            print("-" * 90)
+            for r in rows:
+                flag = "YES" if r.get("would_click") else "-"
+                ident = f"id={r.get('id','')[:18]!r} cls={r.get('cls','')[:22]!r}"
+                print(f"{r['score']:>7.1f}  {flag:<4} {r['frame']:<10} "
+                      f"<{r['tag']:<8}> {r['text'][:34]!r}  {ident}")
+            best = rows[0]
+            print("-" * 90)
+            print(f"最高分: {best['score']} ({best['text'][:40]!r}) "
+                  f"{'会被点击' if best.get('would_click') else '低于阈值，不会点击'}")
+            return 0
+
+        result = clicker.click(
+            url,
+            verify=lambda: app.checker.check().state is NetState.INTERNET_OK,
+            headless=False if getattr(args, "headed", False) else None,
+            keep_open=True if getattr(args, "keep_open", False) else None,
+        )
+        print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
+        return 0 if result.success else 2
 
     # ---- run：常驻守护 ---------------------------------------------------
     lock = None

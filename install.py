@@ -163,7 +163,7 @@ def install_deps(skip: bool = False) -> bool:
             break
     else:
         print("\n      [X] 依赖安装失败。请手动执行：")
-        print(f"          {sys.executable} -m pip install requests PyYAML psutil")
+        print(f"          {sys.executable} -m pip install requests PyYAML psutil selenium")
         return False
 
     # 复核依赖是否真的可导入
@@ -174,6 +174,17 @@ def install_deps(skip: bool = False) -> bool:
         print((probe.stdout or "") + (probe.stderr or ""))
         return False
     print("      依赖已就绪: requests / PyYAML / psutil")
+
+    # selenium 是"自动点击"功能所需；缺失不影响主流程（会退回打开浏览器）
+    probe_sel = run([sys.executable, "-c", "import selenium; print(selenium.__version__)"],
+                    capture=True)
+    sel_version = (probe_sel.stdout or "").strip()
+    if probe_sel.returncode == 0 and sel_version:
+        print(f"      自动点击依赖已就绪: selenium {sel_version}")
+    else:
+        print("      [!] selenium 未安装：\"自动点击连接按钮\"功能将不可用，")
+        print("          程序会自动退回到\"打开浏览器让用户点\"的方式。")
+        print(f"          需要时执行: {sys.executable} -m pip install selenium")
     return True
 
 
@@ -204,6 +215,25 @@ def probe_network() -> int:
     meaning = {0: "网络正常", 1: "状态未知", 2: "需要认证（Portal）", 3: "链路未连接"}.get(code, "未知")
     print(f"      退出码 {code} => {meaning}")
     return code
+
+
+def prepare_autoclick(prefetch: bool) -> None:
+    """检查 selenium，并可选地预下载浏览器驱动（首次必须联网）。"""
+    probe = run([sys.executable, "-c", "import selenium"], capture=True)
+    if probe.returncode != 0:
+        print("      未安装 selenium：自动点击不可用（仍会自动打开认证页）")
+        return
+    if not prefetch:
+        print("      已安装 selenium（自动点击可用）")
+        print(f"      首次使用前建议预下载驱动: {sys.executable} auto_portal_auth.py driver --download")
+        return
+    print("      正在初始化浏览器驱动（首次需要联网下载，可能需要几十秒）...")
+    proc = py_main("driver", "--download")
+    if proc.returncode == 0:
+        print("      浏览器驱动就绪，自动点击功能可用")
+    else:
+        print("      [!] 驱动初始化失败（可能当前无法上网），不影响其它功能")
+        print("          可稍后在有网时执行: python auto_portal_auth.py driver --download")
 
 
 def do_autostart(method: str, start_now: bool) -> bool:
@@ -243,6 +273,8 @@ def main(argv=None) -> int:
     parser.add_argument("--start-now", action="store_true", help="安装后立即在后台启动")
     parser.add_argument("--no-start", action="store_true", help="安装自启后不要立即启动（也不询问）")
     parser.add_argument("--skip-deps", action="store_true", help="跳过依赖安装")
+    parser.add_argument("--prefetch-driver", action="store_true",
+                        help="预下载浏览器驱动（自动点击功能，首次需要联网）")
     parser.add_argument("--no-pause", action="store_true", help="结束时不等待按键")
     parser.add_argument("--no-probe", action="store_true", help="跳过网络探测试运行")
     args = parser.parse_args(argv)
@@ -256,7 +288,7 @@ def main(argv=None) -> int:
         pause_at_end(not args.no_pause)
         return 1
 
-    total = 5
+    total = 6
     failed = False
 
     step(1, total, "检查 Python 环境")
@@ -264,7 +296,7 @@ def main(argv=None) -> int:
         pause_at_end(not args.no_pause)
         return 1
 
-    step(2, total, "安装依赖 (requests / PyYAML / psutil)")
+    step(2, total, "安装依赖 (requests / PyYAML / psutil / selenium)")
     if not install_deps(args.skip_deps):
         failed = True
 
@@ -281,7 +313,10 @@ def main(argv=None) -> int:
         print("\n      试运行一次网络检测 ...")
         probe_network()
 
-    step(5, total, "开机自启")
+    step(5, total, "自动点击准备 (Selenium)")
+    prepare_autoclick(args.prefetch_driver)
+
+    step(6, total, "开机自启")
     want_autostart = args.autostart == "yes"
     if args.autostart == "ask":
         want_autostart = ask("是否安装开机自启？", default="y")
@@ -312,12 +347,15 @@ def main(argv=None) -> int:
     print(f"  查看状态:  {py} auto_portal_auth.py status")
     print(f"  查看统计:  {py} auto_portal_auth.py stats")
     print(f"  超时分析:  {py} auto_portal_auth.py analyze")
+    print(f"  自动点击:  {py} auto_portal_auth.py autoclick --explain")
+    print(f"  预下驱动:  {py} auto_portal_auth.py driver --download")
+    print(f"  安装扩展:  {py} auto_portal_auth.py install-extension")
     print(f"  常驻运行:  {py} auto_portal_auth.py run")
     print(f"  卸载自启:  {py} auto_portal_auth.py uninstall")
     print(f"  日志文件:  {BASE / 'logs' / 'auto_portal_auth.log'}")
     print(LINE)
-    print("  提示：把 config.yaml 中 auth.auto_login.enabled 改为 true 并填入")
-    print("        账号密码，即可实现无人值守的全自动登录。")
+    print("  提示：认证页上的\"连接/登录\"按钮由 browser_automation 自动点击；")
+    print("        若识别不到，可用 autoclick --explain 查看打分并补充关键词。")
     print(LINE)
 
     pause_at_end(not args.no_pause)

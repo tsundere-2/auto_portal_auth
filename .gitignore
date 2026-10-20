@@ -1,0 +1,11 @@
+# 运行时产物
+logs/
+data/
+*.log
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 含账号密码的本地配置：绝对不要提交（模板见 config.example.yaml）
+config.yaml

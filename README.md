@@ -1,6 +1,6 @@
 # AutoPortalAuth — 校园网 Portal 自动认证守护程序
 
-> 解决"睡眠唤醒 / 开机后必须打开浏览器才能上网"的问题：主动探测 → 发现被 Portal 拦截 → 自动触发认证 → 恢复网络，并统计空闲超时规律做**心跳保活**，把掉线消灭在发生之前。
+> 解决"睡眠唤醒 / 开机后必须打开浏览器才能上网"的问题：主动探测 → 发现被 Portal 拦截 → 自动触发认证 → **自动勾选条款并点掉"连接/登录"按钮** → 恢复网络，并统计空闲超时规律做**心跳保活**，把掉线消灭在发生之前。
 
 ---
 
@@ -10,6 +10,7 @@
 - [快速开始](#快速开始)
 - [命令一览](#命令一览)
 - [配置文件重点项](#配置文件重点项)
+- [自动点击认证按钮（三套方案）](#自动点击认证按钮三套方案)
 - [关键实现细节](#关键实现细节)
   - [1. 如何判断"未连接" vs "需要认证"](#1-如何判断未连接-vs-需要认证)
   - [2. 如何识别 Portal 认证页面](#2-如何识别-portal-认证页面)
@@ -53,7 +54,7 @@
 
 1. 每 `monitor.interval` 秒（默认 30s）向 `http://www.msftconnecttest.com/connecttest.txt` 等目标发一次 HTTP 请求；
 2. 若返回 3xx 重定向、状态码不符、或正文不含预期内容 → 判定**被 Portal 拦截**，抓取认证页真实地址与页面正文；
-3. 对页面做厂商指纹识别，然后按顺序尝试：**静默自动登录** → **自定义触发命令** → **HTTP GET 戳认证页** → **打开默认浏览器**；
+3. 对页面做厂商指纹识别，然后按顺序尝试：**静默自动登录** → **自定义触发命令** → **Selenium 自动勾选条款并点击"连接/登录"** → **HTTP GET 戳认证页** → **打开默认浏览器**；
 4. 认证后重新探测，确认真的能上网了才算成功（否则指数退避重试并累计失败次数）；
 5. 全程写入日志、`data/stats.json`（统计）、`data/state.json`（当前状态快照）。
 
@@ -119,6 +120,9 @@ pythonw auto_portal_auth.py run
 | `analyze` | 分析观测到的**空闲超时**，给出建议的保活间隔 |
 | `install` | 安装开机自启，`--method registry\|startup\|task\|systemd\|launchd`，`--start-now` 立即启动 |
 | `uninstall` | 卸载开机自启 |
+| `autoclick` | 打开认证页 → 自动勾选条款 → 点击"连接/登录" → 验证联网。`--explain` 只打印候选元素打分（调参用）、`--headed` 显示窗口、`--url` 指定页面、`--selector` 追加选择器 |
+| `driver` | 检查浏览器与驱动；`--download` 预下载驱动（首次需联网） |
+| `install-extension` | 打开浏览器扩展管理页并显示 `extension/` 目录（方案 C） |
 | `selftest` | 内置自检：用锐捷 / Dr.COM / 深澜 / H3C 等样例页面验证指纹识别 |
 
 通用参数：`-c/--config 路径`、`-v/--verbose`、`--log-level DEBUG`。
@@ -143,6 +147,11 @@ auth:
     enabled: true
     interval: 0           # 0 = 自动（依据 stats 里的空闲超时中位数 × 0.6）
 
+browser_automation:       # ★ 自动勾选条款 + 点击"连接/登录"按钮
+  enabled: true
+  headless: auto          # auto = 先无头，失败再显示窗口
+  button_texts: []        # 识别不到按钮时，在这里补充按钮文本关键词
+
 notification:
   enabled: true           # 认证成功/失败时的系统通知
 ```
@@ -151,6 +160,169 @@ notification:
 > 执行 `python auto_portal_auth.py analyze` 看到建议值后，把 `auth.keepalive.interval`
 > 设为略小于超时时间的值，掉线率会显著下降。若你的 Portal 允许脚本登录（多数锐捷/深澜的
 > `/eportal`、`/srun_portal` 接口都可以），再填账号密码开启 `auto_login`。
+
+---
+
+## 自动点击认证按钮（三套方案）
+
+### 问题在哪
+
+程序已经能在唤醒后自动打开认证页，但页面上还差"最后一下"：
+
+- 认证页不是标准的用户名/密码表单，而是一个 **"连接 / 登录 / 一键上网"按钮**（MAC 无感认证常见）；
+- 按钮旁可能有 **"我已阅读并同意《服务条款》"复选框**，不勾选时后端直接拒绝；
+- 有的 Portal 还会弹 `confirm`/`alert`，或用 `window.open` 开新窗口放"确认"按钮；
+- 页面上的按钮是 JS 动态渲染的，打开瞬间还不存在。
+
+`portal_autoclick.py` 就是为这"最后一下"写的：**真正驱动浏览器去勾选和点击**，
+而不是再打开一个页面让用户自己点。
+
+### 方案 A：Selenium 浏览器自动化（默认启用）
+
+一次自动点击的完整流程：
+
+```
+启动浏览器（默认无头，失败自动换可见窗口）
+        │
+        ├─ 打开认证页（允许自签证书、绕过系统代理）
+        ├─ 逐层扫描 DOM：document → iframe/frame（最多 3 层）→ Shadow DOM
+        ├─ 勾选"同意/我已阅读/服务条款/隐私政策"类复选框（已勾选的绝不重复点）
+        ├─ 候选元素打分：文本权重 + id/class/name 关键词 + type=submit + 是否在表单内
+        │     减去：取消/退出/断开/下载/注册/忘记密码/已连接/不可见/禁用
+        ├─ 分数 ≥ score_threshold(5) 才点击；否则宁可不点，避免乱点
+        ├─ 处理 alert/confirm，跟进点击后新出现的窗口并继续找"确认"
+        └─ 轮询真实联网状态（复用主程序的探测），确认成功才算完成
+```
+
+关键设计：
+
+| 设计 | 原因 |
+| --- | --- |
+| `headless: auto` | 先无头（不打扰用户、省资源）；有些 Portal 的 JS 在无头下不工作，失败后自动换可见窗口重试一次 |
+| 专用 `profile_dir` | 使用 `data/browser_profile`，保留"记住我"和 MAC 认证所需状态，且**不碰你日常浏览器的配置**（不会因为 Chrome 正在运行而冲突） |
+| 分数阈值 + 否定词 | 认证页上常有"取消/下载客户端/找回密码"，乱点会导致更麻烦的后果 |
+| 失败退避 | 连续失败 `failure_threshold` 次后暂停 `failure_cooldown` 秒，期间退回"打开浏览器"兜底，避免每次巡检都启动浏览器 |
+| 失败留证 | 自动保存截图 + HTML 到 `data/autoclick/`，方便补充关键词或选择器 |
+
+### 方案 B：HTTP 直连（`auth.auto_login`）
+
+适用于标准表单 Portal（锐捷 ePortal、深澜 srun 等）。本次增强了三点：
+
+1. **提交按钮的 `name/value` 也会一起提交** —— 很多 Portal 会校验"是哪个按钮提交的"，
+   漏掉它就会一直返回"请点击连接"；
+2. `<button>` 标签也会被解析（以前只解析 `<input>`）；
+3. **未勾选的复选框不再提交**，避免后端认为"未同意条款"；
+4. 页面**没有表单**时直接跳过（MAC 无感认证页只有一个按钮），不再白等 `verify_timeout` 秒。
+
+### 方案 C：浏览器扩展（`extension/`，最轻量）
+
+不需要 Python、不需要驱动，认证页一打开就自动勾选并点击：
+
+```bat
+python auto_portal_auth.py install-extension
+```
+
+它会打开浏览器的扩展管理页和 `extension/` 目录，然后：
+**开发人员模式 → 加载解压缩的扩展 → 选择该目录**（只需一次）。
+
+扩展有三道安全闸门，避免在别的网站乱点：内网 IP / 认证关键词 / 用户白名单，
+且按钮必须打分 ≥ 5、每个元素只点一次。详见 [`extension/README.md`](extension/README.md)。
+
+### 三套方案怎么选
+
+| | A. Selenium | B. HTTP 直连 | C. 浏览器扩展 |
+| --- | --- | --- | --- |
+| 依赖 | selenium + 浏览器驱动 | 无 | 无 |
+| 首次准备 | `driver --download`（需联网） | 无需 | 手工加载一次扩展 |
+| 速度 | 3–10 秒 | < 1 秒 | 页面打开即点 |
+| 能处理"连接"按钮 | ✅ | ❌ | ✅ |
+| 能处理复选框/弹窗/iframe | ✅ | 部分 | ✅ |
+| 能验证真的联网了 | ✅ | ✅ | ❌（只看页面） |
+
+**推荐组合**：主程序开方案 A；同时装上扩展 C 作为双保险。
+即使某天驱动下载失败或 Portal 改版，扩展依然会把按钮点掉。
+
+### 命令
+
+```bat
+:: 0) 首次：预下载浏览器驱动（必须在能上网时做一次，之后离线可用）
+python auto_portal_auth.py driver --download
+
+:: 1) 看看你的认证页能不能被识别（只打分，不点击）★ 最有用
+python auto_portal_auth.py autoclick --explain
+
+:: 2) 立即执行一次（会真的打开浏览器点击，并验证联网）
+python auto_portal_auth.py autoclick
+
+:: 3) 想看着它点（调试用）
+python auto_portal_auth.py autoclick --headed --keep-open
+
+:: 4) 指定页面 / 追加选择器
+python auto_portal_auth.py autoclick --url http://10.0.0.1/portal --selector "#loginBtn"
+```
+
+`--explain` 的输出长这样（分数、是否会被点击、所在 frame、元素文本与属性）：
+
+```
+     分数  点击   frame      元素         文本 / 属性
+------------------------------------------------------------------------------------------
+   20.0  YES  top>0      <button  > '连接'  id='connect-btn' cls=''
+  -12.0  -    top        <button  > '取消'  id='cancel-btn' cls='cancel'
+  -28.0  -    top        <a       > '下载客户端'  id='' cls='dl'
+```
+
+### 识别不到按钮怎么办
+
+按顺序尝试：
+
+1. **看打分表**：`autoclick --explain`。如果目标按钮分数低于 5，把它文本里的独特词加进配置：
+
+   ```yaml
+   browser_automation:
+     button_texts: ["我要上网", "立即认证"]     # 权重 9
+   ```
+
+2. **按钮没有文本**（纯图标/图片）：加 CSS 选择器（权重按属性计算）：
+
+   ```yaml
+   browser_automation:
+     extra_button_selectors: ["#my-login-btn", ".auth-area .go"]
+   ```
+
+3. **误点到别的元素**：把它的文本加入否定词：
+
+   ```yaml
+   browser_automation:
+     button_deny_texts: ["注销", "重新登录"]
+   ```
+
+4. **看现场**：失败时 `data/autoclick/fail-*.png` 与 `fail-*.html` 保存了截图和页面源码，
+   把 HTML 发出来即可针对性地补规则。
+
+5. **页面在 iframe 里但没被扫到**：确认 `max_frame_depth`（默认 3）足够，或直接用
+   `--selector` 指定。
+
+也可以完全关掉自动点击（回到旧行为）：
+
+```yaml
+browser_automation:
+  enabled: false
+```
+
+### 与主程序的执行顺序
+
+`AuthTrigger.trigger()` 的尝试顺序（前一步成功就停止）：
+
+```
+1. auth.auto_login（HTTP 表单）
+2. auth.trigger_commands（自定义命令）
+3. browser_automation（Selenium 勾选 + 点击）   ← 新增
+4. HTTP GET 认证页（建立会话）
+5. 打开默认浏览器（最后的兜底）
+```
+
+第 3 步成功后会**跳过**第 4、5 步，因此不会再多弹一个浏览器窗口。
+若第 3 步点了但没确认联网，仍会执行第 4、5 步，保证你能看到页面并手动收尾。
 
 ---
 
@@ -367,6 +539,12 @@ Linux 想让服务在**未登录**时也运行：`sudo loginctl enable-linger $U
 | 显示需要认证但 `portal_url` 为空 | 认证服务器返回的是非 HTTP 响应（如 ICMP 重定向）或页面为空白。把 `detect.probe_portal_page` 保持 true，并检查 `portal_max_hops` |
 | 判定为"正常"但其实打不开网页 | 你的探测目标被劫持成了"看起来正常"的页面。加一个 `expect_contains` 更严格的目标，或加 HTTPS 目标 |
 | 自动登录总是失败 | 页面依赖 JS 加密（如深澜的 `SHA1` 混淆）或需要验证码。此时把 `auto_login.enabled` 关掉，改用 `open_browser`，或写自定义脚本挂到 `auth.trigger_commands` |
+| 认证页弹出了，但"连接"按钮还要人手点 | 这是本版本新增功能的靶心：确认 `browser_automation.enabled: true` 且 selenium 已安装。先用 `python auto_portal_auth.py autoclick --explain` 看是否能识别到按钮；识别不到就按[识别不到按钮怎么办](#识别不到按钮怎么办)补关键词 |
+| 日志提示"未安装 selenium" | `python -m pip install selenium`，然后 `python auto_portal_auth.py driver --download` 预下载驱动（第一次需要联网） |
+| `driver --download` 失败 / 提示 Selenium Manager | 首次必须能上外网。可以在能上网的环境执行一次，驱动会缓存到 `~/.cache/selenium`；或改用扩展方案 C |
+| 自动点击"已点击"但没恢复联网 | 看 `data/autoclick/fail-*.png`。常见原因：还需要验证码、点了"取消"、或认证被后端拒绝。把目标按钮文本加进 `button_texts` 或加 `extra_button_selectors` |
+| 无头模式点了没反应 | 用 `headless: false`（或 `autoclick --headed`）。部分 Portal 的 JS 会检测无头浏览器 |
+| 装了扩展但认证页没自动点 | 认证页需刷新一次（安装扩展前已打开的页面不会注入）。点扩展图标选"立即在本页执行一次"看识别结果；内网域名可在弹窗点"本网站总是启用" |
 | 浏览器没有自动弹出 | 检查 `auth.open_browser`；冷却是 90s，同一认证页 90s 内不会重复打开（日志级别 `--log-level DEBUG` 能看到原因） |
 | 唤醒后很久才恢复 | 确认 `wake_fast_probes` > 0；Windows 上可改用 `--method task` 注册唤醒计划任务双保险 |
 | 想确认空闲超时到底多久 | 跑几天后执行 `python auto_portal_auth.py analyze`，看 `median` 与 `suggested_keepalive` |
@@ -397,14 +575,19 @@ Linux 想让服务在**未登录**时也运行：`sudo loginctl enable-linger $U
 
 ```
 auto_portal_auth.py      主程序（检测 / 认证 / 监听 / 统计 / 自启安装 / 命令行）
+portal_autoclick.py      Selenium 自动点击引擎（方案 A：勾选条款 + 点击连接）
 config.yaml             配置文件（全部可选项都有注释）
-requirements.txt        Python 依赖（requests / PyYAML / psutil）
+requirements.txt        Python 依赖（requests / PyYAML / psutil / selenium）
 install.py              交互式安装器（中文提示、UTF-8，跨平台）
 install.bat             Windows 启动器（刻意保持"纯 ASCII + CRLF"，只负责调 install.py）
 install.sh              Linux / macOS 安装脚本
 README.md               本文件
+extension/              浏览器扩展（方案 C：不依赖 Python，页面一开就点）
+tests/                  自动化测试（fake_portal_server.py 假认证页 + test_autoclick.py）
 logs/                   运行日志（自动创建，滚动保留）
 data/                   状态快照 auto_portal_auth.lock(锁) / state.json / stats.json（自动创建）
+  autoclick/            自动点击失败时的截图与 HTML（自动创建）
+  browser_profile/      自动点击专用的浏览器配置（自动创建）
 ```
 
-依赖：Python 3.8+、`requests`、`PyYAML`、`psutil`（可选但强烈建议）。
+依赖：Python 3.8+、`requests`、`PyYAML`、`psutil`（可选但强烈建议）、`selenium`（自动点击用，缺失时自动降级）。

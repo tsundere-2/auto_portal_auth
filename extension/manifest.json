@@ -1,0 +1,24 @@
+{
+  "manifest_version": 3,
+  "name": "校园网 Portal 自动连接",
+  "version": "1.0.0",
+  "description": "自动识别校园网认证页，勾选服务条款并点击“连接/登录”，无需人工操作。",
+  "minimum_chrome_version": "88",
+  "permissions": ["storage", "activeTab"],
+  "host_permissions": ["http://*/*", "https://*/*"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle",
+      "all_frames": true
+    }
+  ],
+  "action": {
+    "default_title": "校园网 Portal 自动连接",
+    "default_popup": "popup.html"
+  }
+}
