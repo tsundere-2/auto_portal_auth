@@ -87,6 +87,44 @@ function doConnect() {
 """
 
 
+# 锐捷 ePortal 风格：按钮文字是背景图，<a> 本身没有任何文本，
+# 周围还有"连接网络"这种看起来可点、其实只是标题的 div/span。
+RUIJIE_HTML = """<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<title>上网认证</title>
+<style>
+  body { margin:0; font-family:"Microsoft YaHei", sans-serif; background:#0b3d91; color:#fff; }
+  #logininfo_hk { padding: 60px; }
+  .span_2 { color:#fff; font-size:20px; cursor:pointer; }
+  #login_btn_1 { position:relative; width:275px; margin-top:20px; }
+  #loginLink { display:block; width:275px; height:54px; text-decoration:none; }
+  #loginLink_div { width:275px; height:54px; background:#1677ff; border-radius:6px; }
+</style></head>
+<body id="loginbody">
+  <div id="logininfo_hk">
+    <div id="oldConnectNetwork">
+      <span class="span_2" id="connectNetworkId">连接网络</span>
+    </div>
+    <div id="login_btn_1">
+      <div id="SLoginBtn_1" class="SLoginBtn_1"><ol><li>
+        <!-- 关键：<a> 没有文字，文字/图标由背景图或 CSS 绘制 -->
+        <a id="loginLink" tabindex="-1"
+           onclick="this.className='loginButtonHKClicked_1';doauthen();">
+          <div id="loginLink_div"></div>
+        </a>
+      </li></ol></div>
+    </div>
+  </div>
+<script>
+function doauthen() {
+  document.getElementById('loginLink_div').innerText = '已连接';
+  document.title = '认证成功';
+}
+</script>
+</body></html>
+"""
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     server_version = "FakePortal/1.0"
 
@@ -117,6 +155,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send(200, OUTER_HTML.encode("utf-8"))
         elif path == "/inner":
             self._send(200, INNER_HTML.encode("utf-8"))
+        elif path == "/ruijie":
+            self._send(200, RUIJIE_HTML.encode("utf-8"))
         elif path == "/status":
             body = json.dumps({"online": bool(STATE["online"]),
                                "clicks": STATE["clicks"]}).encode("utf-8")

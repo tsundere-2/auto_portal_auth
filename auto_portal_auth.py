@@ -42,6 +42,7 @@ import argparse
 import collections
 import copy
 import ctypes
+import ipaddress
 import json
 import logging
 import logging.handlers
@@ -636,6 +637,86 @@ def guess_vendor(url: str, html: str) -> Fingerprint:
     return fp
 
 
+# URL 打分：判断"这个地址像不像真正的认证页"
+_ASSET_RE = re.compile(
+    r"\.(?:js|css|png|jpe?g|gif|ico|svg|woff2?|ttf|eot|mp4|mp3)(?:\?|#|$)", re.I)
+_LINK_RE = re.compile(r"""https?://[^\s"'<>\\]+""", re.I)
+_JS_NAV_RE = re.compile(
+    r"""(?:window\.)?location(?:\.href)?\s*=\s*["']([^"']+)["']"""
+    r"""|window\.open\s*\(\s*["']([^"']+)["']""", re.I)
+
+
+def _portal_link_score(url: str) -> int:
+    """给一个 URL 打分，越高越像认证页（0 表示完全不像）。"""
+    if not url:
+        return 0
+    u = url.lower()
+    if not u.startswith(("http://", "https://")) or _ASSET_RE.search(u) or len(url) > 2000:
+        return 0
+    score = 0
+    if "eportal" in u:
+        score += 4
+    if "wlanuserip=" in u:
+        score += 3
+    if "portal" in u:
+        score += 2
+    if "login" in u or "logon" in u:
+        score += 1
+    if "auth" in u or "wlan" in u:
+        score += 1
+    try:
+        host = urlparse(url).hostname or ""
+        if ipaddress.ip_address(host).is_private:
+            score += 1
+    except ValueError:
+        pass
+    return score
+
+
+def extract_portal_link(base_url: str, html: str) -> str:
+    """从探测响应里找出真正的认证页地址。
+
+    锐捷 / 深澜等网关在访问 connecttest.txt 这类地址时，经常返回一个
+    "200 + meta/JS 跳转"的中间页，真正的 ePortal 地址还带着
+    wlanuserip、mac、nasid 等参数。直接用探测地址打开，登录按钮
+    可能因为缺参数而失效，所以这里尽量还原出完整地址。
+    """
+    if not html:
+        return ""
+    candidates: List[str] = []
+
+    # 1) meta refresh
+    try:
+        refresh = _MetaRefreshParser()
+        refresh.feed(html[:100_000])
+        if refresh.url:
+            candidates.append(urljoin(base_url, refresh.url))
+    except Exception:
+        pass
+
+    # 2) 正文里的绝对地址
+    for m in _LINK_RE.finditer(html[:200_000]):
+        candidates.append(m.group(0).replace("&amp;", "&"))
+
+    # 3) JS 跳转（location.href=... / window.open(...)）
+    for m in _JS_NAV_RE.finditer(html[:200_000]):
+        raw = m.group(1) or m.group(2) or ""
+        if raw and not raw.lower().startswith(("javascript:", "#")):
+            candidates.append(urljoin(base_url, raw))
+
+    best, best_score = "", 0
+    seen = set()
+    for url in candidates:
+        url = url.strip().rstrip(").,;\"'")
+        if not url or url in seen or url == base_url:
+            continue
+        seen.add(url)
+        score = _portal_link_score(url)
+        if score > best_score:
+            best, best_score = url, score
+    return best if best_score >= 3 else ""
+
+
 # ===========================================================================
 # 5. 网络检测器
 # ===========================================================================
@@ -873,6 +954,16 @@ class NetworkChecker:
             html = portal_result.body_sample
             if not html and self.cfg.get("detect.probe_portal_page", True):
                 html = self._fetch_portal_page(status.portal_url)
+            # 探测地址常常只是"中间页"：正文里才有带 wlanuserip/mac 的
+            # 真实 ePortal 地址。还原它，Selenium 点按钮时才不会缺参数。
+            if _portal_link_score(status.portal_url) < 3:
+                better = extract_portal_link(status.portal_url, html)
+                if better:
+                    LOG.info("从探测响应中定位到认证页: %s", better)
+                    status.portal_url = better
+                    if self.cfg.get("detect.probe_portal_page", True):
+                        html = self._fetch_portal_page(better) or html
+                    status.detail += " | 已定位认证页"
             status.fingerprint = guess_vendor(status.portal_url, html)
             status.fingerprint.portal_url = status.portal_url
             return status
@@ -1074,6 +1165,13 @@ class AuthTrigger:
 
         target = status.portal_url
         form = status.fingerprint.login_form if status.fingerprint else None
+        vendor = (status.fingerprint.vendor if status.fingerprint else "") or ""
+        # 锐捷 ePortal（index.jsp + doauthen）的认证由页面 JS 完成；
+        # 页面上的表单多半是隐藏的初始化表单（如 validateHaijun.do），
+        # 把账号密码 POST 过去既无效、又可能触发风控，直接交给自动点击。
+        if vendor == "ruijie" and not (al.get("extra_fields") or {}):
+            LOG.debug("锐捷 ePortal 由页面 JS(doauthen) 完成认证，跳过通用表单登录")
+            return False
         method = "post"
         if form and form.action:
             target = urljoin(status.portal_url, form.action)

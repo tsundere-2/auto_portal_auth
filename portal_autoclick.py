@@ -102,6 +102,25 @@ ATTR_KEYWORDS: Dict[str, float] = {
     "连接": 3, "登录": 3, "认证": 2, "上网": 3,
 }
 
+# 供应商特有的"无文字按钮"：按钮文字是背景图 / CSS 画的，
+# 文本为空，只能靠 id / onclick 识别。取匹配到的最高权重，不累加。
+BUTTON_ATTR_BONUS: List[Tuple[str, float]] = [
+    ("loginlink", 9),      # 锐捷 ePortal: <a id="loginLink"><div></div></a>
+    ("doauthen", 9),       # 锐捷 ePortal: onclick="...doauthen();"
+    ("sloginbtn", 6),      # 锐捷 ePortal: <div id="SLoginBtn_1" class="SLoginBtn_1">
+    ("login_btn", 4),
+    ("loginbtn", 4),
+]
+
+# 这些标签本身不是"可点击控件"：文字往往来自子元素（例如整个登录框），
+# 点它们通常什么都不会发生。只有带 onclick/href/role=button 时才网开一面。
+NON_INTERACTIVE_TAGS = {
+    "div", "span", "td", "th", "tr", "table", "tbody", "thead", "tfoot",
+    "ul", "ol", "li", "p", "section", "article", "header", "footer",
+    "h1", "h2", "h3", "h4", "h5", "h6", "b", "i", "em", "strong",
+    "font", "small", "center",
+}
+
 # 条款复选框的文本特征
 TERMS_KEYWORDS = [
     "同意", "已阅读", "已同意", "服务条款", "服务协议", "隐私政策", "隐私",
@@ -161,6 +180,7 @@ return (function (extraSel) {
         cls: (typeof el.className === 'string' ? el.className : (el.getAttribute('class') || '')).slice(0, 160),
         name: el.getAttribute('name') || '',
         type: (el.getAttribute('type') || '').toLowerCase(),
+        role: (el.getAttribute('role') || '').toLowerCase(),
         text: ((el.innerText || el.value || el.getAttribute('aria-label') ||
                 el.getAttribute('title') || el.getAttribute('alt') || '') + '')
                 .replace(/\s+/g, ' ').trim().slice(0, 140),
@@ -527,6 +547,20 @@ def score_candidate(c: Dict[str, Any],
         if kw in attrs:
             score += weight
 
+    # 无文字按钮（背景图 / CSS 绘制）靠 id、onclick 识别
+    bonus = max((w for kw, w in BUTTON_ATTR_BONUS if kw in attrs), default=0.0)
+    score += bonus
+
+    # 容器/文字标签不是按钮：文本多半来自子元素，点它不会有任何反应
+    if c.get("tag") in NON_INTERACTIVE_TAGS:
+        onclick = str(c.get("onclick") or "").strip()
+        href = str(c.get("href") or "").strip().lower()
+        role = str(c.get("role") or "").strip().lower()
+        has_handler = (bool(onclick) or role in ("button", "link")
+                       or href not in ("", "#", "javascript:void(0)", "javascript:;"))
+        if not has_handler:
+            score -= 10.0
+
     if c.get("type") == "submit":
         score += 3.0
     if c.get("tag") == "button":
@@ -572,6 +606,9 @@ class PortalAutoClicker:
         self.threshold = float(cfg.get("browser_automation.score_threshold", 5))
         self.dump_dir = cfg.resolve_path(
             cfg.get("browser_automation.dump_dir", "data/autoclick"))
+        # 本次会话已经点过的元素签名：点错了（比如点到"连接网络"这个标题）
+        # 就换下一个候选，而不是反复点同一个无效元素。
+        self._tried: set = set()
 
     # -- 对外能力 ---------------------------------------------------------
     @property
@@ -740,9 +777,18 @@ class PortalAutoClicker:
         return res
 
     # -- 单次浏览器会话 ----------------------------------------------------
+    def _signature(self, c: Dict[str, Any]) -> str:
+        """用于判断"这个元素本轮是不是已经点过了"。"""
+        return "|".join([
+            str(c.get("tag", "")), str(c.get("id", "")),
+            (c.get("text") or "")[:40].strip(),
+            (c.get("onclick") or "")[:40].strip(),
+        ])
+
     def _run_session(self, driver, portal_url: str, res: AutoclickResult,
                      verify: Optional[Callable[[], bool]],
                      attempts: int, budget: float) -> bool:
+        self._tried = set()
         try:
             driver.get(portal_url)
         except Exception as exc:
@@ -861,9 +907,13 @@ class PortalAutoClicker:
             c["score"] = score_candidate(c, self.button_texts, self.deny_texts)
             scored.append((c["score"], i, c))
         scored.sort(key=lambda x: x[0], reverse=True)
-        if scored and scored[0][0] >= self.threshold:
-            best_idx = scored[0][1]
-            best = scored[0][2]
+        eligible = [item for item in scored if item[0] >= self.threshold]
+        if eligible:
+            # 优先选"本轮还没点过"的候选；都点过了再退回最高分，
+            # 保证不会因为去重而完全不点。
+            fresh = [item for item in eligible if self._signature(item[2]) not in self._tried]
+            pick = (fresh or eligible)[0]
+            best_idx, best = pick[1], pick[2]
 
         # 3) 没有把握就放弃（宁可不点，也不乱点）
         if best is None:
@@ -890,6 +940,7 @@ class PortalAutoClicker:
             return False
 
         res.clicked = True
+        self._tried.add(self._signature(best))
         self.log.info("已点击认证按钮: 「%s」 (tag=%s score=%.1f, %s)",
                       res.clicked_text, res.clicked_tag, res.score, state)
         # 只记录"点击后新出现"的窗口，避免误把浏览器已有的其它窗口当成弹窗

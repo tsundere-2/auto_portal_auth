@@ -540,6 +540,8 @@ Linux 想让服务在**未登录**时也运行：`sudo loginctl enable-linger $U
 | 判定为"正常"但其实打不开网页 | 你的探测目标被劫持成了"看起来正常"的页面。加一个 `expect_contains` 更严格的目标，或加 HTTPS 目标 |
 | 自动登录总是失败 | 页面依赖 JS 加密（如深澜的 `SHA1` 混淆）或需要验证码。此时把 `auto_login.enabled` 关掉，改用 `open_browser`，或写自定义脚本挂到 `auth.trigger_commands` |
 | 认证页弹出了，但"连接"按钮还要人手点 | 这是本版本新增功能的靶心：确认 `browser_automation.enabled: true` 且 selenium 已安装。先用 `python auto_portal_auth.py autoclick --explain` 看是否能识别到按钮；识别不到就按[识别不到按钮怎么办](#识别不到按钮怎么办)补关键词 |
+| 锐捷 ePortal：按钮没有文字（`<a id="loginLink">` 里只有空 div） | 这种按钮的文字是背景图，早期版本按文本打分会识别不到。现在按 `id=loginLink` / `onclick=doauthen()` / `SLoginBtn` 识别，`--explain` 里应看到 `score >= 15`。同理，`连接网络` 这种标题文字（div/span）会被判为"非按钮"扣分，不会乱点 |
+| 改了代码/升级后仍旧要手动点 | 守护进程是常驻的，**启动时**就把代码读进内存了。改完代码必须重启：任务管理器结束 `pythonw.exe`，再重新运行（或注销重登，让自启项拉起新进程） |
 | 日志提示"未安装 selenium" | `python -m pip install selenium`，然后 `python auto_portal_auth.py driver --download` 预下载驱动（第一次需要联网） |
 | `driver --download` 失败 / 提示 Selenium Manager | 首次必须能上外网。可以在能上网的环境执行一次，驱动会缓存到 `~/.cache/selenium`；或改用扩展方案 C |
 | 自动点击"已点击"但没恢复联网 | 看 `data/autoclick/fail-*.png`。常见原因：还需要验证码、点了"取消"、或认证被后端拒绝。把目标按钮文本加进 `button_texts` 或加 `extra_button_selectors` |

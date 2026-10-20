@@ -47,6 +47,19 @@
     '连接': 3, '登录': 3, '认证': 2, '上网': 3
   };
 
+  // 无文字按钮（文字是背景图 / CSS 画的）只能靠 id / onclick 识别，取最高分不累加
+  const BUTTON_ATTR_BONUS = [
+    ['loginlink', 9], ['doauthen', 9], ['sloginbtn', 6], ['login_btn', 4], ['loginbtn', 4]
+  ];
+
+  // 这些标签不是"可点击控件"，文本多半来自子元素（整个登录框），点了没反应
+  const NON_INTERACTIVE = new Set([
+    'div', 'span', 'td', 'th', 'tr', 'table', 'tbody', 'thead', 'tfoot',
+    'ul', 'ol', 'li', 'p', 'section', 'article', 'header', 'footer',
+    'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'b', 'i', 'em', 'strong',
+    'font', 'small', 'center'
+  ]);
+
   const TERMS_RE = /同意|已阅读|已同意|服务条款|服务协议|隐私政策|隐私|用户协议|我已|agree|terms|policy|privacy|accept/i;
   const PORTAL_RE = /portal|认证|上网|登录|登陆|校园网|网络接入|eportal|srun|drcom|wlan|hotspot|captive|wifi|welcome/i;
 
@@ -104,6 +117,20 @@
     for (const [kw, w] of Object.entries(ATTR_KEYWORDS)) {
       if (attrs.includes(kw)) s += w;
     }
+    let bonus = 0;
+    for (const [kw, w] of BUTTON_ATTR_BONUS) {
+      if (attrs.includes(kw)) bonus = Math.max(bonus, w);
+    }
+    s += bonus;
+
+    const tag = (el.tagName || '').toLowerCase();
+    const onclick = (el.getAttribute('onclick') || '').trim();
+    const href = (el.getAttribute('href') || '').trim().toLowerCase();
+    const role = (el.getAttribute('role') || '').toLowerCase();
+    const hasHandler = !!onclick || role === 'button' || role === 'link'
+      || (href !== '' && href !== '#' && !href.startsWith('javascript:'));
+    if (NON_INTERACTIVE.has(tag) && !hasHandler) s -= 10;
+
     const type = (el.getAttribute('type') || '').toLowerCase();
     if (type === 'submit') s += 3;
     if (el.tagName === 'BUTTON') s += 2;

@@ -86,6 +86,29 @@ class TestScoring(unittest.TestCase):
         # 状态文字"已连接"不是按钮
         self.assertLess(self._score(text="已连接", tag="span", cls="status"), 5)
 
+    def test_textless_image_button(self):
+        """锐捷 ePortal：<a id="loginLink"><div></div></a>，按钮文字是背景图。"""
+        real = self._score(
+            tag="a", id="loginLink",
+            onclick="this.className='loginButtonHKClicked_1';doauthen();")
+        self.assertGreaterEqual(real, 15)
+        self.assertGreater(real, self._score(tag="div", id="logininfo_hk",
+                                             text="连接网络 校园网 记住密码"))
+
+    def test_container_and_label_are_not_buttons(self):
+        """整个登录框 / "连接网络"标题文字不能当成按钮点。"""
+        container = self._score(tag="div", id="logininfo_hk",
+                                text="连接网络 校园网 记住密码")
+        label = self._score(tag="span", id="connectNetworkId", cls="span_2",
+                            text="连接网络")
+        self.assertLess(container, 5)
+        self.assertLess(label, 5)
+
+    def test_interactive_div_still_allowed(self):
+        """div 上真的绑了 onclick 时不该被误伤。"""
+        self.assertGreaterEqual(self._score(tag="div", text="连接",
+                                            onclick="doLogin()"), 8)
+
 
 @unittest.skipUnless(pac.selenium_available(), "未安装 selenium")
 @unittest.skipUnless(pac.find_browser("auto")[0], "未找到 Edge/Chrome")
@@ -122,6 +145,15 @@ class TestBrowser(unittest.TestCase):
         self.assertTrue(self.srv.online)
         self.assertTrue(self.srv.clicks, "后端没收到认证请求")
         self.assertTrue(self.srv.clicks[-1]["agreed"], "提交时条款未被勾选")
+
+    def test_ruijie_textless_button(self):
+        """锐捷 ePortal：按钮没有文字，周围还有"连接网络"标题干扰。"""
+        url = self.srv.url.replace("/portal", "/ruijie")
+        result = self.clicker.click(url, verify=None)
+        self.assertTrue(result.clicked, f"没有点击任何按钮: {result.error} {result.to_dict()}")
+        self.assertEqual(result.clicked_tag, "a", f"点错了元素: {result.to_dict()}")
+        self.assertGreaterEqual(result.score, 15)
+        self.assertTrue(result.success, f"点击后页面没有出现成功提示: {result.to_dict()}")
 
 
 if __name__ == "__main__":
