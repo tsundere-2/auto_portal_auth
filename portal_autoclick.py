@@ -50,6 +50,7 @@ import platform
 import re
 import shutil
 import subprocess
+import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -1012,6 +1013,29 @@ class PortalAutoClicker:
 # ---------------------------------------------------------------------------
 # 7. 预下载驱动（首次必须联网）
 # ---------------------------------------------------------------------------
+def driver_version(caps: Dict[str, Any]) -> str:
+    """从 WebDriver capabilities 里取出真正的**驱动**版本。
+
+    不同浏览器把驱动版本放在不同的厂商命名空间里：
+      Chrome -> caps["chrome"]["chromedriverVersion"]
+      Edge   -> caps["msedge"]["msedgedriverVersion"]
+      Firefox-> caps["moz:geckoDriverVersion"]
+    注意 platformName 是操作系统名（windows），不是驱动版本。
+    """
+    candidates: List[str] = []
+    for key, field in (("chrome", "chromedriverVersion"),
+                       ("msedge", "msedgedriverVersion")):
+        section = caps.get(key)
+        if isinstance(section, dict) and section.get(field):
+            candidates.append(str(section[field]))
+    if caps.get("moz:geckoDriverVersion"):
+        candidates.append(str(caps["moz:geckoDriverVersion"]))
+    for value in candidates:
+        # chromedriver 的值形如 "155.0.4283.62 (a1b2c3...)"，去掉括号里的提交哈希
+        return value.split(" (")[0].strip()
+    return "?"
+
+
 def ensure_driver(cfg, browser: str = "auto", headless: bool = True) -> Tuple[bool, str]:
     """创建一次驱动再退出，用于在有网时预先把 msedgedriver/chromedriver 拉下来。"""
     if not selenium_available():
@@ -1022,8 +1046,9 @@ def ensure_driver(cfg, browser: str = "auto", headless: bool = True) -> Tuple[bo
         return False, f"驱动初始化失败: {type(exc).__name__}: {exc}"
     try:
         caps = driver.capabilities or {}
-        msg = (f"驱动就绪: browser={key} version={caps.get('browserVersion', '?')} "
-               f"driver={caps.get('platformName', '?')}")
+        msg = (f"驱动就绪: browser={key} {caps.get('browserVersion', '?')} "
+               f"driver={driver_version(caps)} "
+               f"python={sys.executable}")
         return True, msg
     finally:
         try:

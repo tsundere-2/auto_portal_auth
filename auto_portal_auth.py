@@ -312,6 +312,10 @@ class Config:
         cfg_path = Path(path).expanduser().resolve() if path else Path(__file__).resolve().parent / "config.yaml"
         if not cfg_path.exists():
             cfg = cls(path=cfg_path)
+            if yaml is None:
+                # 缺 PyYAML 时无法写默认配置；由调用方统一给"缺少依赖"提示，
+                # 这里保持安静，避免再叠一条误导性的"生成失败"。
+                return cfg
             try:
                 cfg_path.parent.mkdir(parents=True, exist_ok=True)
                 with cfg_path.open("w", encoding="utf-8") as f:
@@ -321,6 +325,11 @@ class Config:
             except Exception as exc:  # 配置目录不可写时，仅使用内置默认值
                 print(f"[!] 生成默认配置失败({exc})，将使用内置默认值", file=sys.stderr)
             return cfg
+
+        if yaml is None:
+            # 不是"配置文件写错了"，而是当前解释器没装 PyYAML。
+            # 交给 main() 的依赖检查统一提示，避免误导用户去改配置。
+            return cls(path=cfg_path)
 
         try:
             with cfg_path.open("r", encoding="utf-8") as f:
@@ -2344,6 +2353,50 @@ def selftest() -> int:
     return 0 if failures == 0 else 1
 
 
+def load_config_local_only(path: Optional[str]) -> Config:
+    """给 driver / install-extension 这类纯本地命令加载配置。
+
+    它们只需要"浏览器路径 / 配置目录"等少量信息，不应该因为当前 Python
+    没装 PyYAML 就报"解析配置文件失败"。读不了就直接用内置默认值。
+    """
+    if yaml is not None:
+        return Config.load(path)
+    cfg_path = Path(path).expanduser().resolve() if path else Path(__file__).resolve().parent / "config.yaml"
+    return Config(path=cfg_path)
+
+
+def cmd_driver(cfg: Config, args) -> int:
+    """检查 / 预下载浏览器驱动。纯本地命令，不需要 requests 或 PyYAML。"""
+    if portal_autoclick is None:
+        print("[X] 找不到 portal_autoclick.py（请确认目录完整）", file=sys.stderr)
+        return 1
+    if not portal_autoclick.selenium_available():
+        print(f"[X] 当前 Python 未安装 selenium：{sys.executable}", file=sys.stderr)
+        print(f"    请执行: \"{sys.executable}\" -m pip install selenium", file=sys.stderr)
+        return 1
+
+    if not getattr(args, "download", False):
+        key, exe = portal_autoclick.find_browser(getattr(args, "browser", "auto"))
+        print(json.dumps({
+            "python": sys.executable,
+            "selenium": portal_autoclick.selenium_version(),
+            "browser": key or None,
+            "executable": exe or None,
+        }, ensure_ascii=False, indent=2))
+        if not key:
+            print("[X] 未找到 Edge / Chrome", file=sys.stderr)
+            return 1
+        return 0
+
+    ok, msg = portal_autoclick.ensure_driver(
+        cfg, getattr(args, "browser", "auto"),
+        headless=not getattr(args, "headed", False))
+    print(("[OK] " if ok else "[X] ") + msg)
+    if not ok:
+        print("提示：首次下载驱动需要能上网；可在能上网时先执行一次本命令。")
+    return 0 if ok else 1
+
+
 def cmd_install_extension() -> int:
     """方案 C：把浏览器扩展装进 Edge/Chrome（需要用户手工确认一次）。"""
     ext = Path(__file__).resolve().parent / "extension"
@@ -2506,18 +2559,33 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = build_parser().parse_args(argv)
+    command = args.command or "run"
+
+    # ---- 纯本地命令：不依赖 requests / PyYAML -----------------------------
+    # driver 只需要 selenium（找浏览器、下载驱动），install-extension 只需要浏览器。
+    # 放在 Config.load() 之前，避免"当前 Python 缺 PyYAML"时先打一条
+    # "解析配置文件失败"的噪音，再被依赖检查挡住。
+    if command in ("driver", "install-extension"):
+        cfg = load_config_local_only(args.config)
+        setup_logging(cfg, verbose=args.verbose, level_override=args.log_level)
+        if command == "driver":
+            return cmd_driver(cfg, args)
+        return cmd_install_extension()
 
     cfg = Config.load(args.config)
     setup_logging(cfg, verbose=args.verbose, level_override=args.log_level)
 
     if requests is None or yaml is None:
         missing = [n for n, m in (("requests", requests), ("PyYAML", yaml)) if m is None]
-        LOG.error("缺少依赖: %s，请执行: pip install -r requirements.txt", ", ".join(missing))
+        LOG.error("当前 Python 缺少依赖: %s", ", ".join(missing))
+        LOG.error("解释器: %s", sys.executable)
+        LOG.error("请执行: \"%s\" -m pip install -r \"%s\"",
+                  sys.executable, Path(__file__).resolve().parent / "requirements.txt")
+        LOG.error("提示：机器上可能装了多个 Python，请用装了依赖的那个"
+                  "（py -0p 可列出全部解释器）。")
         return 1
     if psutil is None:
         LOG.warning("未安装 psutil，网卡状态检测能力将降级（建议安装: pip install psutil）")
-
-    command = args.command or "run"
 
     # ---- 不依赖 AutoPortalAuth 的命令 ------------------------------------
     if command == "selftest":
@@ -2548,32 +2616,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
 
     if command == "driver":
-        if portal_autoclick is None:
-            LOG.error("找不到 portal_autoclick.py（请确认文件完整）")
-            return 1
-        if not portal_autoclick.selenium_available():
-            LOG.error("未安装 selenium，请执行: python -m pip install selenium")
-            return 1
-        if not args.download:
-            key, exe = portal_autoclick.find_browser(args.browser)
-            print(json.dumps({
-                "selenium": portal_autoclick.selenium_version(),
-                "browser": key or None,
-                "executable": exe or None,
-            }, ensure_ascii=False, indent=2))
-            if not key:
-                LOG.error("未找到 Edge / Chrome")
-                return 1
-            return 0
-        ok, msg = portal_autoclick.ensure_driver(cfg, args.browser,
-                                                 headless=not args.headed)
-        (LOG.info if ok else LOG.error)(msg)
-        if not ok:
-            LOG.info("提示：首次下载驱动需要能上网；可在能上网时先执行一次本命令。")
-        return 0 if ok else 1
-
-    if command == "install-extension":
-        return cmd_install_extension()
+        return cmd_driver(cfg, args)
 
     # ---- 需要 AutoPortalAuth 实例的命令 ----------------------------------
     if command == "run" and getattr(args, "interval", None):

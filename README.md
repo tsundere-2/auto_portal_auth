@@ -121,7 +121,7 @@ pythonw auto_portal_auth.py run
 | `install` | 安装开机自启，`--method registry\|startup\|task\|systemd\|launchd`，`--start-now` 立即启动 |
 | `uninstall` | 卸载开机自启 |
 | `autoclick` | 打开认证页 → 自动勾选条款 → 点击"连接/登录" → 验证联网。`--explain` 只打印候选元素打分（调参用）、`--headed` 显示窗口、`--url` 指定页面、`--selector` 追加选择器 |
-| `driver` | 检查浏览器与驱动；`--download` 预下载驱动（首次需联网） |
+| `driver` | 检查浏览器与驱动；`--download` 预下载驱动（首次需联网）。纯本地命令，不依赖 requests / PyYAML，并会打印驱动版本与当前解释器路径 |
 | `install-extension` | 打开浏览器扩展管理页并显示 `extension/` 目录（方案 C） |
 | `selftest` | 内置自检：用锐捷 / Dr.COM / 深澜 / H3C 等样例页面验证指纹识别 |
 
@@ -534,7 +534,7 @@ Linux 想让服务在**未登录**时也运行：`sudo loginctl enable-linger $U
 | 现象 | 排查方向 |
 | --- | --- |
 | 双击 `install.bat` 后不停报 `'ython' 不是内部或外部命令` | 说明 `install.bat` 被改成了纯 LF 换行，或里面加了中文/`chcp`。cmd.exe 读取 .bat 必须是 CRLF；切换代码页后它会丢字符。本仓库的 `install.bat` 保持"纯 ASCII + CRLF"即可，中文提示在 `install.py` 里。修复换行：`(Get-Content install.bat -Raw) -replace "\r?\n","\r\n" \| Set-Content install.bat -Encoding ASCII` |
-| 提示 `缺少依赖: requests, PyYAML` | `install.bat` 挑中的 Python 解释器没装依赖。直接跑 `python install.py`（它会给该解释器装依赖），或手动 `python -m pip install -r requirements.txt`。想固定解释器：`python install.py` 里会用 `sys.executable`，之后自启也用同一个 |
+| 提示 `缺少依赖: requests, PyYAML` | 首次安装直接跑 `python install.py`（它会给**当前解释器**装依赖）。机器上常有多个 Python（如商店版/托管版 3.13、`py -3` 指向的 3.14），用 `py -0p` 列出全部解释器，再用装了依赖的那个绝对路径运行，例如 `"C:\Users\...\Python312\python.exe" auto_portal_auth.py status`。错误信息里现在会直接打印解释器路径和对应的 pip 命令，复制即可。只有 `driver` / `install-extension` 两个纯本地命令不需要 PyYAML |
 | 一直显示 `UNKNOWN`，日志里是 `NameResolutionError` | 校园网 DNS 未下发或需认证。看 `data/state.json` 里的 `probes` 明细；必要时在 `config.yaml` 里换探测目标为学校内网页面 |
 | 显示需要认证但 `portal_url` 为空 | 认证服务器返回的是非 HTTP 响应（如 ICMP 重定向）或页面为空白。把 `detect.probe_portal_page` 保持 true，并检查 `portal_max_hops` |
 | 判定为"正常"但其实打不开网页 | 你的探测目标被劫持成了"看起来正常"的页面。加一个 `expect_contains` 更严格的目标，或加 HTTPS 目标 |
