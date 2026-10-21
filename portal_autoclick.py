@@ -226,6 +226,65 @@ return (function (i) {
 })(arguments[0]);
 """
 
+# 填账号 / 密码。锐捷 ePortal 等页面的输入框初始是 display:none，
+# 只显示一个只读的"用户名/密码"占位提示（#username_tip / #pwd_tip），
+# 聚焦提示框后真正的输入框才会显示。另外 checkForm() 读的是
+# $("#username").attr("value")（HTML 属性），所以属性也要一起写。
+_JS_FILL_LOGIN = r"""
+return (function (user, pwd) {
+  function vis(el) {
+    if (!el) return false;
+    try {
+      var r = el.getBoundingClientRect();
+      if (!r || r.width < 2 || r.height < 2) return false;
+      var s = window.getComputedStyle(el);
+      if (!s) return true;
+      return !(s.visibility === 'hidden' || s.display === 'none' || parseFloat(s.opacity || '1') === 0);
+    } catch (e) { return false; }
+  }
+  function fire(el, types) {
+    for (var i = 0; i < types.length; i++) {
+      try { el.dispatchEvent(new Event(types[i], {bubbles: true})); } catch (e) {}
+    }
+  }
+  function setVal(el, v) {
+    try { el.value = v; } catch (e) {}
+    try { el.setAttribute('value', v); } catch (e) {}   // jQuery .attr('value') 用得到
+    fire(el, ['keydown', 'keypress', 'input', 'keyup', 'change', 'blur']);
+  }
+  function reveal(input, tipId) {
+    if (!input || vis(input)) return;
+    var tip = tipId ? document.getElementById(tipId) : null;
+    if (tip) { try { tip.focus(); } catch (e) {} }     // 聚焦占位提示 -> 页面显示真实输入框
+    if (!vis(input)) { try { input.style.display = ''; } catch (e) {} }
+  }
+  function pick(ids, sel) {
+    for (var i = 0; i < ids.length; i++) {
+      var el = document.getElementById(ids[i]);
+      if (el) return el;
+    }
+    try { return document.querySelector(sel); } catch (e) { return null; }
+  }
+
+  var userEl = pick(['username'],
+    'input[name="username"]:not([type="hidden"]),input[id*="user" i]:not([type="hidden"]),' +
+    'input[name*="user" i]:not([type="hidden"])');
+  var pwdEl = pick(['pwd'],
+    'input[type="password"],input[name="pwd"],input[id*="pwd" i]');
+  if (!pwdEl) return {filled: 0, reason: 'no-password-field'};
+  if (!userEl) return {filled: 0, reason: 'no-username-field'};
+
+  reveal(userEl, 'username_tip');
+  setVal(userEl, user);
+  try { userEl.focus(); } catch (e) {}
+
+  reveal(pwdEl, 'pwd_tip');
+  setVal(pwdEl, pwd);
+  try { pwdEl.focus(); } catch (e) {}
+
+  return {filled: 2, userVisible: vis(userEl), pwdVisible: vis(pwdEl)};
+})(arguments[0], arguments[1]);
+"""
 # 采集复选框 / 条款同意框
 _JS_COLLECT_BOXES = r"""
 return (function () {
@@ -797,6 +856,10 @@ class PortalAutoClicker:
 
         settle = float(self.cfg.get("browser_automation.settle_seconds", 1.5))
         time.sleep(settle)
+        try:
+            self._base_handles = set(driver.window_handles)
+        except Exception:
+            self._base_handles = set()
 
         deadline = time.time() + max(3.0, budget - settle)
         for attempt in range(1, attempts + 1):
@@ -816,6 +879,9 @@ class PortalAutoClicker:
 
             if self._wait_verified(driver, verify, deadline):
                 return True
+
+            # 有些 Portal 过一两秒才弹出新窗口，这里再补处理一次
+            self._follow_new_window(driver, res)
 
             self.log.info("已点击「%s」，但尚未确认联网，准备再试一次 ...", res.clicked_text)
             time.sleep(0.8)
@@ -860,7 +926,38 @@ class PortalAutoClicker:
                         pass
         return False
 
+    def _fill_credentials(self, driver) -> int:
+        """在账号密码登录页里填入 auth.auto_login 的账号密码。
+
+        只在"页面确实有密码框"时才动手（锐捷 ePortal 的输入框默认隐藏，
+        只显示只读占位提示，JS 里会先聚焦提示框把真实输入框唤出来）。
+        密码永不写入日志。
+        """
+        if not self.cfg.get("browser_automation.fill_credentials", True):
+            return 0
+        if not self.cfg.get("auth.auto_login.enabled", False):
+            return 0
+        username = str(self.cfg.get("auth.auto_login.username") or "").strip()
+        password = str(self.cfg.get("auth.auto_login.password") or "")
+        if not username or not password:
+            return 0
+        try:
+            info = driver.execute_script(_JS_FILL_LOGIN, username, password) or {}
+        except Exception as exc:
+            self.log.debug("填写账号密码失败: %s", exc)
+            return 0
+        filled = int(info.get("filled") or 0)
+        if filled:
+            self.log.info("已填写登录账号「%s」和密码（密码框可见=%s）",
+                          username, info.get("pwdVisible"))
+        else:
+            self.log.debug("页面上没有可填写的账号密码框（%s）", info.get("reason", ""))
+        return filled
+
     def _attempt_here(self, driver, res: AutoclickResult) -> bool:
+        # 0) 账号密码登录页：先填账号密码，再找"连接/登录"按钮
+        self._fill_credentials(driver)
+
         # 1) 勾选"同意条款"类复选框
         try:
             boxes = driver.execute_script(_JS_COLLECT_BOXES) or []
@@ -943,14 +1040,28 @@ class PortalAutoClicker:
         self._tried.add(self._signature(best))
         self.log.info("已点击认证按钮: 「%s」 (tag=%s score=%.1f, %s)",
                       res.clicked_text, res.clicked_tag, res.score, state)
-        # 只记录"点击后新出现"的窗口，避免误把浏览器已有的其它窗口当成弹窗
+        time.sleep(float(self.cfg.get("browser_automation.click_delay", 0.8)))
+
+        # 只记录"点击后新出现"的窗口，避免误把浏览器已有的其它窗口当成弹窗。
+        # 放在延迟之后采集：有些 Portal 是 setTimeout 才 window.open 的。
         try:
             self._pending_new_windows = [
                 h for h in driver.window_handles if h not in before_handles
             ]
         except Exception:
             self._pending_new_windows = []
-        time.sleep(float(self.cfg.get("browser_automation.click_delay", 0.8)))
+
+        # 点完立刻看一眼页面自带的错误提示（锐捷会把"密码错误/请填写密码"写在这里）
+        try:
+            err = driver.execute_script(
+                "var ids=['errorInfo_center','error_span_content','errorMsg','error_msg'];" +
+                "for (var i=0;i<ids.length;i++){var e=document.getElementById(ids[i]);" +
+                "if(e){var t=(e.innerText||'').trim(); if(t) return t.slice(0,120);}}" +
+                "return '';") or ""
+            if err:
+                self.log.warning("认证页提示: %s", err)
+        except Exception:
+            pass
         return True
 
     # -- 弹窗 / 新窗口 -----------------------------------------------------
@@ -969,6 +1080,13 @@ class PortalAutoClicker:
     def _follow_new_window(self, driver, res: AutoclickResult) -> None:
         """点击后 portal 可能 window.open 一个新窗口，需要切过去继续操作。"""
         pending = list(getattr(self, "_pending_new_windows", []) or [])
+        if not pending:
+            # 有些 Portal 是延迟 window.open 的：跟会话开始时的窗口列表比
+            try:
+                base = getattr(self, "_base_handles", set())
+                pending = [h for h in driver.window_handles if h not in base]
+            except Exception:
+                pending = []
         self._pending_new_windows = []
         if not pending:
             return
@@ -992,6 +1110,11 @@ class PortalAutoClicker:
         finally:
             self._pending_new_windows = []
             try:
+                # 处理过的窗口记入基线，避免下一轮又当成"新窗口"
+                self._base_handles = set(getattr(self, "_base_handles", set())) | set(pending)
+            except Exception:
+                pass
+            try:
                 if original:
                     driver.switch_to.window(original)
             except Exception:
@@ -1009,14 +1132,17 @@ class PortalAutoClicker:
                 except Exception as exc:
                     self.log.debug("验证回调异常: %s", exc)
             else:
-                # 没有外部回调时，退化为看页面文本
+                # 没有外部回调时，退化为看页面**可见文本**
+                # （不能用 page_source：<script> 里的 "已连接" 之类字样会误判成功）
                 try:
-                    src = driver.page_source or ""
-                    low = src.lower()
-                    if any(t.lower() in low for t in SUCCESS_TEXTS):
-                        return True
+                    text = driver.execute_script(
+                        "return document.body ? (document.body.innerText || '') : ''") or ""
                 except Exception:
-                    pass
+                    text = driver.page_source or ""
+                    text = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", text)
+                low = text.lower()
+                if any(t.lower() in low for t in SUCCESS_TEXTS):
+                    return True
             time.sleep(max(0.5, interval))
             if poll_only:
                 break

@@ -89,6 +89,8 @@ function doConnect() {
 
 # 锐捷 ePortal 风格：按钮文字是背景图，<a> 本身没有任何文本，
 # 周围还有"连接网络"这种看起来可点、其实只是标题的 div/span。
+# 账号框可见、密码框默认隐藏（点占位提示才出现），且后端校验读的是
+# HTML 属性 value（等价于 jQuery 的 $("#username").attr("value")）。
 RUIJIE_HTML = """<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <title>上网认证</title>
@@ -99,12 +101,23 @@ RUIJIE_HTML = """<!DOCTYPE html>
   #login_btn_1 { position:relative; width:275px; margin-top:20px; }
   #loginLink { display:block; width:275px; height:54px; text-decoration:none; }
   #loginLink_div { width:275px; height:54px; background:#1677ff; border-radius:6px; }
+  input { font-size:16px; padding:6px; width:220px; }
+  #errorInfo_center { color:#ffd; height:24px; margin:8px 0; }
 </style></head>
 <body id="loginbody">
   <div id="logininfo_hk">
     <div id="oldConnectNetwork">
       <span class="span_2" id="connectNetworkId">连接网络</span>
     </div>
+    <div>
+      <input id="username_tip" readonly value="用户名" style="display:none">
+      <input id="username" name="username" type="text" value="">
+    </div>
+    <div>
+      <input id="pwd_tip" readonly value="密码" style="display:block">
+      <div id="pwdDiv"><input id="pwd" name="pwd" type="password" style="display:none"></div>
+    </div>
+    <div id="errorInfo_center"></div>
     <div id="login_btn_1">
       <div id="SLoginBtn_1" class="SLoginBtn_1"><ol><li>
         <!-- 关键：<a> 没有文字，文字/图标由背景图或 CSS 绘制 -->
@@ -116,7 +129,23 @@ RUIJIE_HTML = """<!DOCTYPE html>
     </div>
   </div>
 <script>
+document.getElementById('username_tip').addEventListener('focus', function () {
+  this.style.display = 'none';
+  document.getElementById('username').style.display = 'block';
+});
+document.getElementById('pwd_tip').addEventListener('focus', function () {
+  this.style.display = 'none';
+  var p = document.getElementById('pwd');
+  p.style.display = 'block';
+  try { p.focus(); } catch (e) {}
+});
 function doauthen() {
+  var u = document.getElementById('username').getAttribute('value') || '';
+  var p = document.getElementById('pwd').getAttribute('value') || '';
+  var err = document.getElementById('errorInfo_center');
+  if (!u) { err.innerText = '请填写用户名!'; return; }
+  if (!p) { err.innerText = '请填写密码!'; return; }
+  err.innerText = '';
   document.getElementById('loginLink_div').innerText = '已连接';
   document.title = '认证成功';
 }

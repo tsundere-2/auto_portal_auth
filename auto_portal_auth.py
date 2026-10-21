@@ -225,6 +225,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "screenshot_on_failure": True,
         "dump_dir": "data/autoclick",
         "score_threshold": 5,          # 低于该分数宁可不点，避免乱点
+        "fill_credentials": True,      # 账号密码登录页：自动填入 auth.auto_login 的账号密码
         "skip_terms_checkbox": False,  # true = 不自动勾选服务条款
         "accept_alerts": True,         # 自动确认 alert/confirm
         "failure_threshold": 3,        # 连续失败几次后暂时停用
@@ -911,6 +912,21 @@ class NetworkChecker:
             return ""
 
     # ---- 综合判定 ---------------------------------------------------------
+    def is_online(self) -> bool:
+        """轻量判定：只跑探测目标，不抓认证页、不做指纹。
+
+        认证流程里每秒轮询一次时用它，避免每次都重复抓取/解析整个门户页
+        （那会把"从探测响应中定位到认证页"刷满日志，还拖慢验证）。
+        """
+        for target in (self.cfg.get("detect.probe_targets") or []):
+            try:
+                res = self.probe_target(target)
+            except Exception:
+                continue
+            if res.kind == "ok":
+                return True
+        return False
+
     def check(self) -> NetStatus:
         status = NetStatus(checked_at=now_iso())
         link = self.link_info()
@@ -1034,7 +1050,7 @@ class AuthTrigger:
         try:
             result = clicker.click(
                 status.portal_url,
-                verify=lambda: self.checker.check().state is NetState.INTERNET_OK,
+                verify=lambda: self.checker.is_online(),
             )
         except Exception as exc:
             LOG.warning("自动点击过程异常: %s", exc)
@@ -2792,7 +2808,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         result = clicker.click(
             url,
-            verify=lambda: app.checker.check().state is NetState.INTERNET_OK,
+            verify=lambda: app.checker.is_online(),
             headless=False if getattr(args, "headed", False) else None,
             keep_open=True if getattr(args, "keep_open", False) else None,
         )

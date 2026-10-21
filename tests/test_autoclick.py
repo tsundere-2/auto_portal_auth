@@ -148,12 +148,24 @@ class TestBrowser(unittest.TestCase):
 
     def test_ruijie_textless_button(self):
         """锐捷 ePortal：按钮没有文字，周围还有"连接网络"标题干扰。"""
+        cfg = make_cfg(self.tmpdir)
+        cfg.set("auth.auto_login.enabled", True)
+        cfg.set("auth.auto_login.username", "25124308")
+        cfg.set("auth.auto_login.password", "test-pass")
+        clicker = pac.PortalAutoClicker(cfg)
         url = self.srv.url.replace("/portal", "/ruijie")
-        result = self.clicker.click(url, verify=None)
+        result = clicker.click(url, verify=None)
         self.assertTrue(result.clicked, f"没有点击任何按钮: {result.error} {result.to_dict()}")
         self.assertEqual(result.clicked_tag, "a", f"点错了元素: {result.to_dict()}")
         self.assertGreaterEqual(result.score, 15)
         self.assertTrue(result.success, f"点击后页面没有出现成功提示: {result.to_dict()}")
+
+    def test_ruijie_without_credentials_fails_validation(self):
+        """没配账号密码时不该乱填，页面会报"请填写用户名"，正好证明填表逻辑真的生效。"""
+        url = self.srv.url.replace("/portal", "/ruijie")
+        result = self.clicker.click(url, verify=None)
+        self.assertTrue(result.clicked)
+        self.assertFalse(result.success)
 
 
 if __name__ == "__main__":

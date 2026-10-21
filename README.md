@@ -309,14 +309,40 @@ browser_automation:
   enabled: false
 ```
 
+### 需要输入账号密码的页面（锐捷 ePortal 等）
+
+有些 Portal 不是"点一下就过"，而是要真的填账号密码再点登录。开启
+`fill_credentials` 后，自动点击会在**页面存在密码框**时，把
+`auth.auto_login` 里的账号密码填进去再点按钮：
+
+```yaml
+auth:
+  auto_login:
+    enabled: true            # 注意：这里要 true，填表才有账号可用
+    username: "25124308"
+    password: "你的密码"
+
+browser_automation:
+  fill_credentials: true     # 默认就是 true
+```
+
+实现细节（针对锐捷 ePortal 这类页面）：
+
+- 输入框默认是 `display:none`，只显示只读的"用户名/密码"占位提示；
+  脚本会先聚焦 `#pwd_tip` 把真实输入框唤出来，再写入。
+- 页面用 `$("#username").attr("value")` 做非空校验，所以脚本同时写
+  `el.value` 和 `value` 属性，并派发 `input/change/keyup/blur` 事件。
+- 账号密码**只**来自 `auth.auto_login`，不会去猜、不会填到没有密码框的页面。
+- 日志只记录账号，**从不**打印密码。
+
 ### 与主程序的执行顺序
 
 `AuthTrigger.trigger()` 的尝试顺序（前一步成功就停止）：
 
 ```
-1. auth.auto_login（HTTP 表单）
+1. auth.auto_login（HTTP 表单；锐捷 ePortal 由页面 JS 认证，会自动跳过）
 2. auth.trigger_commands（自定义命令）
-3. browser_automation（Selenium 勾选 + 点击）   ← 新增
+3. browser_automation（Selenium 填账号密码 + 勾选 + 点击）   ← 新增
 4. HTTP GET 认证页（建立会话）
 5. 打开默认浏览器（最后的兜底）
 ```
@@ -541,6 +567,7 @@ Linux 想让服务在**未登录**时也运行：`sudo loginctl enable-linger $U
 | 自动登录总是失败 | 页面依赖 JS 加密（如深澜的 `SHA1` 混淆）或需要验证码。此时把 `auto_login.enabled` 关掉，改用 `open_browser`，或写自定义脚本挂到 `auth.trigger_commands` |
 | 认证页弹出了，但"连接"按钮还要人手点 | 这是本版本新增功能的靶心：确认 `browser_automation.enabled: true` 且 selenium 已安装。先用 `python auto_portal_auth.py autoclick --explain` 看是否能识别到按钮；识别不到就按[识别不到按钮怎么办](#识别不到按钮怎么办)补关键词 |
 | 锐捷 ePortal：按钮没有文字（`<a id="loginLink">` 里只有空 div） | 这种按钮的文字是背景图，早期版本按文本打分会识别不到。现在按 `id=loginLink` / `onclick=doauthen()` / `SLoginBtn` 识别，`--explain` 里应看到 `score >= 15`。同理，`连接网络` 这种标题文字（div/span）会被判为"非按钮"扣分，不会乱点 |
+| 点了登录但页面提示"请填写用户名/密码" | 页面需要真的填账号密码。确认 `auth.auto_login.enabled: true` 且 `username` / `password` 已填，`browser_automation.fill_credentials` 保持 true（默认）。日志里会打印"已填写登录账号「xxx」和密码（密码框可见=True）" |
 | 改了代码/升级后仍旧要手动点 | 守护进程是常驻的，**启动时**就把代码读进内存了。改完代码必须重启：任务管理器结束 `pythonw.exe`，再重新运行（或注销重登，让自启项拉起新进程） |
 | 日志提示"未安装 selenium" | `python -m pip install selenium`，然后 `python auto_portal_auth.py driver --download` 预下载驱动（第一次需要联网） |
 | `driver --download` 失败 / 提示 Selenium Manager | 首次必须能上外网。可以在能上网的环境执行一次，驱动会缓存到 `~/.cache/selenium`；或改用扩展方案 C |

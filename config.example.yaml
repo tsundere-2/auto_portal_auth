@@ -137,6 +137,7 @@ browser_automation:
   screenshot_on_failure: true
   dump_dir: "data/autoclick"
   score_threshold: 5              # 低于该分数宁可不点，避免乱点
+  fill_credentials: true          # 账号密码登录页：自动填入 auth.auto_login 的账号密码
   skip_terms_checkbox: false      # true = 不自动勾选服务条款
   accept_alerts: true             # 自动确认 alert/confirm 弹窗
   failure_threshold: 3            # 连续失败几次后暂时停用自动点击
