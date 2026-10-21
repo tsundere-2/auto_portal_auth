@@ -58,12 +58,12 @@ import threading
 import time
 import webbrowser
 from dataclasses import dataclass, field, asdict
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from enum import Enum
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urljoin, urlparse
+from urllib.parse import quote, urljoin, urlparse
 
 # ---------------------------------------------------------------------------
 # 可选依赖：缺失时给出友好提示，而不是直接崩溃
@@ -185,6 +185,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "username_field_keywords": ["user", "name", "account", "acct", "login", "sid", "uid"],
             "password_field_keywords": ["pass", "pwd", "password", "secret"],
             "verify_timeout": 25,  # 提交后等待联网成功的最大秒数
+            # 网关明确说"密码错误/用户不存在"时，暂停自动登录的秒数（防止账号被锁）
+            "fail_cooldown": 1800,
         },
         "keepalive": {
             "enabled": True,
@@ -224,6 +226,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "dump_on_failure": True,       # 失败时保存 HTML/截图，便于调参
         "screenshot_on_failure": True,
         "dump_dir": "data/autoclick",
+        "keep_failure_dumps": 10,       # 只保留最近 N 次失败现场（截图+HTML）
         "score_threshold": 5,          # 低于该分数宁可不点，避免乱点
         "fill_credentials": True,      # 账号密码登录页：自动填入 auth.auto_login 的账号密码
         "skip_terms_checkbox": False,  # true = 不自动勾选服务条款
@@ -719,6 +722,67 @@ def extract_portal_link(base_url: str, html: str) -> str:
 
 
 # ===========================================================================
+# 4b. 锐捷 ePortal 直连接口
+# ===========================================================================
+# 页面 JS（login_bch.js + AuthInterFace.js）最终就是发这个请求：
+#   POST {portal}/InterFace.do?method=login
+#   userId / password / service / queryString / operatorPwd /
+#   operatorUserId / validcode / passwordEncrypt
+# 密码先用页面里的 RSA 公钥加密（security.js 那套老实现），
+# 所以只要复刻加密算法，就能完全跳过浏览器。
+
+# 网关明确说"账号/密码不对"时，别再自动重试（防止账号被锁）
+_FATAL_AUTH_RE = re.compile(
+    r"密码错误|密码不正确|用户名或密码|用户不存在|账号不存在|"
+    r"PASSWORD[_ ]?ERROR|PWD[_ ]?ERROR|USER[_ ]?NOT[_ ]?FOUND|AUTH[_ ]?FAILED", re.I)
+
+
+def _input_value(html: str, element_id: str) -> str:
+    """取某个 <input id="..."> 的 value（不依赖属性顺序）。"""
+    tag = re.search(
+        rf"""<input\b[^>]*\bid=["']{re.escape(element_id)}["'][^>]*>""", html, re.I)
+    if not tag:
+        return ""
+    value = re.search(r"""\bvalue=["']([^"']*)""", tag.group(0), re.I)
+    return value.group(1) if value else ""
+
+
+def _js_encode(value: str) -> str:
+    """等价于 JS 的 encodeURIComponent（quote 默认会多编码 ! ' ( ) *）。"""
+    return quote(str(value), safe="-_.!~*'()")
+
+
+def ruijie_rsa_encrypt(text: str, exponent_hex: str, modulus_hex: str) -> str:
+    """复刻锐捷 security.js 里的 RSAUtils.encryptedString。
+
+    与标准 RSA 的差别（也是必须照抄的原因）：
+      * 明文按 **小端 16 位字** 组成大整数（不是大端字节流）；
+      * 分块长度 = 2 * 模数的最高 16 位字下标（1024 位密钥是 126 字节）；
+      * 输出从高字到低字、每字 4 个十六进制字符（即标准大端 hex）。
+
+    已用 Node 直接跑页面自带的 security.js 逐字节比对过，结果一致。
+    """
+    m = int(modulus_hex, 16)
+    e = int(exponent_hex, 16)
+    chunk = 2 * ((m.bit_length() - 1) // 16)
+    if m <= 0 or e <= 0 or chunk <= 0:
+        raise ValueError("无效的 RSA 公钥")
+    data = [ord(ch) & 0xFF for ch in text]
+    while len(data) % chunk:
+        data.append(0)
+    out: List[str] = []
+    for i in range(0, len(data), chunk):
+        block = 0
+        for j in range(chunk // 2):
+            block |= (data[i + 2 * j] | (data[i + 2 * j + 1] << 8)) << (16 * j)
+        piece = format(pow(block, e, m), "x")
+        if len(piece) % 4:
+            piece = "0" * (4 - len(piece) % 4) + piece
+        out.append(piece)
+    return "".join(out)
+
+
+# ===========================================================================
 # 5. 网络检测器
 # ===========================================================================
 class NetworkChecker:
@@ -731,6 +795,9 @@ class NetworkChecker:
             raise RuntimeError("缺少依赖 requests，请先执行: pip install -r requirements.txt")
         self.cfg = cfg
         self._session = requests.Session()
+        # 上一次 check() 抓到的认证页正文，供认证流程复用（省一次 GET）
+        self._last_portal_url = ""
+        self._last_portal_html = ""
         # 关键：忽略系统代理。校园网/公司网络里的 HTTP_PROXY 会把探测请求导向代理，
         # 导致我们看不到 Portal 的重定向。
         if cfg.get("detect.ignore_system_proxy", True):
@@ -826,8 +893,11 @@ class NetworkChecker:
         return (float(self.cfg.get("detect.connect_timeout", 3)),
                 float(self.cfg.get("detect.read_timeout", 5)))
 
-    def probe_target(self, target: Dict[str, Any]) -> ProbeResult:
-        """探测单个目标，判定：ok / portal / error。"""
+    def probe_target(self, target: Dict[str, Any], fetch_portal: bool = True) -> ProbeResult:
+        """探测单个目标，判定：ok / portal / error。
+
+        fetch_portal=False 时不做"跟随跳转 + 抓认证页"（用于认证后的快速验证）。
+        """
         name = target.get("name") or target.get("url") or "?"
         url = target["url"]
         expect_status = target.get("expect_status")
@@ -849,9 +919,9 @@ class NetworkChecker:
         if resp.status_code in self.REDIRECT_CODES:
             res.kind = "portal"
             res.redirect_chain = [resp.url]
-            res.final_url = self._follow_redirects(resp, res.redirect_chain)
+            res.final_url = self._follow_redirects(resp, res.redirect_chain) if fetch_portal else resp.url
             res.detail = f"HTTP {resp.status_code} -> {res.final_url}"
-            if self.cfg.get("detect.probe_portal_page", True):
+            if fetch_portal and self.cfg.get("detect.probe_portal_page", True):
                 html = self._fetch_portal_page(res.final_url)
                 res.body_sample = html[:4000]
             return res
@@ -920,7 +990,7 @@ class NetworkChecker:
         """
         for target in (self.cfg.get("detect.probe_targets") or []):
             try:
-                res = self.probe_target(target)
+                res = self.probe_target(target, fetch_portal=False)
             except Exception:
                 continue
             if res.kind == "ok":
@@ -982,6 +1052,8 @@ class NetworkChecker:
                     status.detail += " | 已定位认证页"
             status.fingerprint = guess_vendor(status.portal_url, html)
             status.fingerprint.portal_url = status.portal_url
+            self._last_portal_url = status.portal_url
+            self._last_portal_html = html
             return status
 
         status.state = NetState.UNKNOWN
@@ -1013,6 +1085,9 @@ class AuthTrigger:
         self._autoclick_init_failed = False
         self._autoclick_fail_streak = 0
         self._autoclick_disabled_until = 0.0
+        # 账号密码被网关明确拒绝时（密码错误等），一段时间内不再自动尝试，
+        # 避免反复登录把校园网账号锁掉。
+        self._auth_disabled_until = 0.0
 
     # ---- 自动点击引擎 -----------------------------------------------------
     def _get_autoclicker(self):
@@ -1064,8 +1139,12 @@ class AuthTrigger:
 
         if ok:
             self._autoclick_fail_streak = 0
-            LOG.info("自动点击完成认证：点击了「%s」，勾选 %d 项，用时 %.1fs",
-                     result.clicked_text, len(result.checkboxes or []), result.duration)
+            if result.clicked:
+                LOG.info("自动点击完成认证：点击了「%s」，勾选 %d 项，用时 %.1fs",
+                         result.clicked_text, len(result.checkboxes or []), result.duration)
+            else:
+                LOG.info("网络已恢复（自动点击未点到按钮，可能由页面跳转或人工完成，用时 %.1fs）",
+                         result.duration)
             return True
 
         # 失败：记录原因、递增退避
@@ -1168,6 +1247,112 @@ class AuthTrigger:
         data.update({str(k): str(v) for k, v in (al.get("extra_fields") or {}).items()})
         return data
 
+    def ruijie_login(self, status: NetStatus) -> bool:
+        """锐捷 ePortal：直接 POST InterFace.do?method=login。
+
+        复刻页面 doauthen() 的请求（含 RSA 密码加密），约 1 秒完成，
+        不需要启动浏览器，也不用等页面渲染。失败时静默返回 False，
+        后面还有 Selenium 自动点击兜底。
+        """
+        al = self.cfg.get("auth.auto_login") or {}
+        if not al.get("enabled") or not al.get("username") or not al.get("password"):
+            return False
+        if time.time() < self._auth_disabled_until:
+            return False
+        if not status.portal_url:
+            return False
+        vendor = (status.fingerprint.vendor if status.fingerprint else "") or ""
+        if vendor != "ruijie":
+            return False
+        # 用户明确关掉"用配置的账号密码"时，不能偷偷用
+        if not self.cfg.get("browser_automation.fill_credentials", True):
+            return False
+
+        portal_url = status.portal_url
+        # check() 刚刚抓过就用缓存，避免认证时再 GET 一次
+        html = ""
+        if getattr(self.checker, "_last_portal_url", "") == portal_url:
+            html = getattr(self.checker, "_last_portal_html", "")
+        if not html:
+            html = self.checker._fetch_portal_page(portal_url)
+        if not html:
+            return False
+
+        # 页面用隐藏域 passwordEncrypt 决定密码是否要 RSA 加密（默认 true）
+        encrypt = (_input_value(html, "passwordEncrypt").strip().lower() or "true")
+        query = urlparse(portal_url).query or ""
+        mac = "111111111"
+        for part in query.split("&"):
+            if part.lower().startswith("mac="):
+                mac = part[4:] or mac
+                break
+        username = str(al.get("username") or "").strip()
+        # 服务名（页面隐藏域 net_access_type，例如 "shu"）：漏掉它网关会认为
+        # 登录的服务不对，直接返回失败。
+        service = _input_value(html, "net_access_type")
+        if encrypt == "true":
+            exponent = _input_value(html, "publicKeyExponent")
+            modulus = _input_value(html, "publicKeyModulus")
+            if not (exponent and modulus):
+                LOG.debug("锐捷页面未提供 RSA 公钥，改用浏览器自动点击")
+                return False
+            try:
+                encrypted = ruijie_rsa_encrypt(
+                    f"{al.get('password')}>{mac}"[::-1], exponent, modulus)
+            except Exception as exc:
+                LOG.warning("锐捷密码加密失败: %s", exc)
+                return False
+        else:
+            encrypted = str(al.get("password") or "")
+
+        body = (
+            f"userId={_js_encode(_js_encode(username))}"
+            f"&password={_js_encode(_js_encode(encrypted))}"
+            f"&service={_js_encode(_js_encode(service))}"
+            f"&queryString={_js_encode(_js_encode(query))}"
+            f"&operatorPwd=&operatorUserId=&validcode="
+            f"&passwordEncrypt={_js_encode(_js_encode(encrypt))}"
+        )
+        url = urljoin(portal_url, "InterFace.do?method=login")
+        parsed = urlparse(portal_url)
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "Referer": portal_url,
+            "Origin": f"{parsed.scheme}://{parsed.netloc}",
+            "X-Requested-With": "XMLHttpRequest",
+        }
+        try:
+            resp = self.checker._session.post(
+                url, data=body.encode("utf-8"), headers=headers,
+                timeout=self.checker._timeout(), allow_redirects=False)
+            text = resp.text or ""
+        except Exception as exc:
+            LOG.warning("锐捷直连登录请求失败: %s", exc)
+            return False
+
+        if not re.search(r"""["']?result["']?\s*:\s*["']?success""", text):
+            msg = re.search(r"""message\s*:\s*["']([^"']{0,120})""", text)
+            detail = msg.group(1) if msg else text[:120].replace("\n", " ")
+            if _FATAL_AUTH_RE.search(detail):
+                cooldown = float(al.get("fail_cooldown", 1800))
+                self._auth_disabled_until = time.time() + cooldown
+                LOG.error("锐捷直连登录被拒绝（%s）。%.0f 分钟内不再自动尝试，"
+                          "请检查 config.yaml 里的账号密码，避免账号被锁", detail, cooldown)
+            else:
+                LOG.warning("锐捷直连登录未成功: HTTP %s %s", resp.status_code, detail)
+            return False
+
+        LOG.info("锐捷直连登录已提交（HTTP %s），等待网络恢复...", resp.status_code)
+        timeout = min(float(al.get("verify_timeout", 25)), 12.0)
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self.checker.is_online():
+                LOG.info("锐捷直连登录成功，网络已恢复")
+                return True
+            time.sleep(1.0)
+        LOG.warning("锐捷直连登录返回成功，但 %.0f 秒内仍未联网", timeout)
+        return False
+
     def auto_login(self, status: NetStatus) -> bool:
         """尝试用配置的账号密码自动登录，然后验证是否真的联网成功。"""
         al = self.cfg.get("auth.auto_login") or {}
@@ -1175,6 +1360,8 @@ class AuthTrigger:
             return False
         if not al.get("username") or not al.get("password"):
             LOG.warning("已启用自动登录但未配置用户名/密码，跳过")
+            return False
+        if time.time() < self._auth_disabled_until:
             return False
         if not status.portal_url:
             return False
@@ -1214,12 +1401,11 @@ class AuthTrigger:
             LOG.warning("登录请求失败: %s", exc)
             return False
 
-        # 提交后轮询验证，直到超时
+        # 提交后轮询验证，直到超时（用轻量探测，避免每次都重抓认证页）
         deadline = time.time() + float(al.get("verify_timeout", 25))
         while time.time() < deadline:
-            time.sleep(2)
-            verify = self.checker.check()
-            if verify.state is NetState.INTERNET_OK:
+            time.sleep(1.0)
+            if self.checker.is_online():
                 LOG.info("自动登录成功，网络已恢复")
                 return True
         LOG.warning("自动登录后仍无法联网（可能账号密码错误或页面需要 JS/验证码）")
@@ -1238,7 +1424,17 @@ class AuthTrigger:
         LOG.info("触发认证: 厂商=%s 置信度=%s URL=%s",
                  vendor, status.fingerprint.confidence if status.fingerprint else 0, portal_url)
 
-        # 1) 有账号密码 -> 优先静默自动登录（最省事、无需人工）
+        # 网关明确拒绝了账号密码：冷却期内什么都别做，避免把账号试锁
+        if time.time() < self._auth_disabled_until:
+            LOG.debug("账号密码之前被网关拒绝，冷却中，跳过自动认证")
+            return False
+
+        # 1) 锐捷 ePortal：直连接口最快（复刻页面 doauthen，~1 秒）
+        if self.ruijie_login(status):
+            self.successes += 1
+            return True
+
+        # 2) 其它 Portal：有账号密码时尝试通用表单登录（无需人工）
         if self.auto_login(status):
             self.successes += 1
             return True
@@ -1263,7 +1459,11 @@ class AuthTrigger:
         self.poke_portal(portal_url)
 
         # 5) 最后兜底：打开浏览器（让用户点一下，或页面的 JS 自动完成认证）
-        self.open_browser(portal_url, force=force_browser)
+        if self.open_browser(portal_url, force=force_browser):
+            # 已经交给默认浏览器了：给用户/页面 JS 一点时间，别马上又拉起
+            # 自动化窗口去抢操作（之前就是这样和用户的手动登录撞在一起的）。
+            self._autoclick_disabled_until = time.time() + float(
+                self.cfg.get("auth.browser_cooldown", 90))
         return False
 
 
@@ -1910,16 +2110,23 @@ class AutoPortalAuth:
         end = time.monotonic() + seconds
         fast_probes = int(self.cfg.get("monitor.wake_fast_probes", 0)) if wake_fast else 0
         fast_used = 0
+        last_resume = float(getattr(self, "_last_resume_mono", 0.0))
         while not self.stop_event.is_set():
             remaining = end - time.monotonic()
             if remaining <= 0:
                 break
             self.stop_event.wait(min(0.5, remaining))
             events = self.watcher.poll()
-            if "suspend" in events:
+            if "suspend" in events and "resume" not in events:
                 # 休眠期间不做任何事，等唤醒事件
                 LOG.debug("系统进入休眠")
             if "resume" in events:
+                # 同一次唤醒可能被"时钟启发式"和"电源广播"各报一次，只处理第一次
+                now = time.monotonic()
+                if now - last_resume < 15:
+                    continue
+                last_resume = now
+                self._last_resume_mono = now
                 self.after_wake = True
                 self.stats.add_wake_event()
                 self.notifier.on_wake()
@@ -1989,7 +2196,9 @@ class AutoPortalAuth:
 
         if self.session_start is None:
             self.session_start = time.time()
-            if prev.state is NetState.PORTAL_REQUIRED or self.after_wake or initial:
+            # 只有"刚休眠醒来"或"刚从认证页恢复"才算真正的恢复；单纯重启守护进程
+            # 不该发"自动认证成功"的通知（那时本来就在线）。
+            if prev.state is NetState.PORTAL_REQUIRED or self.after_wake:
                 downtime = (self.session_start - self.last_ok_ts) if self.last_ok_ts else None
                 LOG.info("网络恢复%s", f"（中断 {human_duration(downtime)}）" if downtime else "")
                 self.stats.add_auth_result(True)

@@ -49,7 +49,6 @@ import os
 import platform
 import re
 import shutil
-import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
@@ -531,6 +530,21 @@ def _chrome_like_options(browser: str, cfg, headless: bool, profile_dir: Optiona
     return opts
 
 
+def _cached_driver_path(browser: str) -> str:
+    """返回 Selenium Manager 已缓存好的驱动路径（没有则空字符串）。
+
+    直接指定 service 可以完全跳过 Selenium Manager 的"联网检查版本"：
+    断网时那一步会卡好几秒（而这正是我们最需要快的时候）。
+    """
+    name = "msedgedriver" if browser == "edge" else "chromedriver"
+    base = Path(os.environ.get("USERPROFILE") or os.path.expanduser("~")) / ".cache" / "selenium"
+    try:
+        found = sorted(base.glob(f"{name}/win64/*/{name}.exe"))
+    except Exception:
+        return ""
+    return str(found[-1]) if found else ""
+
+
 def create_driver(cfg, browser: str = "auto", headless: bool = True,
                   use_profile: bool = True):
     """创建一个 WebDriver；调用方负责 quit()。"""
@@ -548,10 +562,28 @@ def create_driver(cfg, browser: str = "auto", headless: bool = True,
     opts = _chrome_like_options(key, cfg, headless, profile_dir)
     LOG.debug("启动浏览器: %s (%s) headless=%s profile=%s", key, exe, headless, profile_dir)
 
-    if key == "edge":
-        driver = webdriver.Edge(options=opts)
-    else:
-        driver = webdriver.Chrome(options=opts)
+    service = None
+    cached = _cached_driver_path(key)
+    if cached:
+        try:
+            if key == "edge":
+                from selenium.webdriver.edge.service import Service as EdgeService
+                service = EdgeService(executable_path=cached)
+            else:
+                from selenium.webdriver.chrome.service import Service as ChromeService
+                service = ChromeService(executable_path=cached)
+        except Exception:
+            service = None
+
+    factory = webdriver.Edge if key == "edge" else webdriver.Chrome
+    try:
+        driver = factory(options=opts, service=service) if service else factory(options=opts)
+    except Exception:
+        if service is None:
+            raise
+        # 浏览器升级后缓存驱动可能版本不匹配：交回 Selenium Manager 处理
+        LOG.debug("缓存驱动不可用，回退到 Selenium Manager")
+        driver = factory(options=opts)
 
     page_timeout = float(cfg.get("browser_automation.page_load_timeout", 20))
     try:
@@ -637,14 +669,6 @@ def score_candidate(c: Dict[str, Any],
             score -= 14.0
 
     return round(score, 2)
-
-
-def looks_like_portal_page(url: str, title: str, body_sample: str) -> bool:
-    """给浏览器扩展 / --explain 用的粗判：这个页面像不像校园网认证页。"""
-    hay = f"{url} {title} {body_sample}".lower()
-    keys = ("portal", "认证", "登录", "上网", "connect", "login", "eportal",
-            "srun", "drcom", "wlan", "校园网", "网络接入", "welcome")
-    return any(k in hay for k in keys)
 
 
 # ---------------------------------------------------------------------------
@@ -868,6 +892,10 @@ class PortalAutoClicker:
             if not clicked:
                 # 没找到按钮时，等一下 DOM 可能还在渲染
                 if verify and verify():
+                    # 这一轮没点到任何东西，网络却恢复了：多半是页面自己跳转，
+                    # 或者用户已经在别处登录了，不要记成"自动点击成功"。
+                    res.clicked = False
+                    res.clicked_text = ""
                     return True
                 self._dismiss_dialogs(driver)
                 time.sleep(1.0)
@@ -1176,12 +1204,34 @@ class PortalAutoClicker:
                                      "请查看截图 %s", res.screenshot or "(未保存)")
             except Exception:
                 pass
+            self._prune_dumps(prefix)
         except Exception as exc:
             self.log.debug("保存诊断文件失败: %s", exc)
+
+    def _prune_dumps(self, prefix: str) -> None:
+        """只保留最近 N 次失败现场，避免日志/截图无限增长。"""
+        keep = int(self.cfg.get("browser_automation.keep_failure_dumps", 10))
+        if keep <= 0:
+            return
+        try:
+            files = sorted(self.dump_dir.glob(f"{prefix}-*"),
+                           key=lambda p: p.stat().st_mtime, reverse=True)
+            for old in files[keep * 2:]:
+                try:
+                    old.unlink()
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     def _log_done(self, res: AutoclickResult, started: float) -> None:
         res.duration = round(time.time() - started, 2)
         res.checkboxes = list(dict.fromkeys(res.checkboxes))   # 去重，便于阅读
+        if not res.clicked:
+            # 一个按钮都没点到，但网络确实恢复了（页面自己跳转 / 用户手动登录）
+            self.log.info("网络已恢复（本次未点击按钮，用时 %.1fs；可能由页面自动跳转或其它方式完成）",
+                          res.duration)
+            return
         self.log.info("自动点击认证成功（浏览器=%s headless=%s 用时=%.1fs 点击=%r 勾选=%s）",
                       res.browser, res.headless, res.duration,
                       res.clicked_text, res.checkboxes or "无")

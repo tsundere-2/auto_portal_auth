@@ -214,6 +214,29 @@ notification:
 3. **未勾选的复选框不再提交**，避免后端认为"未同意条款"；
 4. 页面**没有表单**时直接跳过（MAC 无感认证页只有一个按钮），不再白等 `verify_timeout` 秒。
 
+### 方案 B+：锐捷 ePortal 直连接口（默认优先，约 1 秒）
+
+锐捷的 `index.jsp` 页面其实不是表单提交，而是 `doauthen()` → `AuthInterFace.login()` →
+`POST ./InterFace.do?method=login`。本程序直接复刻了这个请求，**完全不启动浏览器**：
+
+1. GET 认证页，取出隐藏域 `publicKeyExponent` / `publicKeyModulus`；
+2. 按页面 `security.js` 的算法加密 `密码 + ">" + mac`（小端 16 位字分块 + 反向字符串，
+   已用 Node 跑页面原版 JS 逐字节比对）；
+3. `POST InterFace.do?method=login`，字段与页面完全一致
+   （`userId` / `password` / `service` / `queryString` / `passwordEncrypt`，双重
+   `encodeURIComponent`）；
+4. 用轻量探测确认联网（1 秒一次，最多 12 秒）。
+
+只有这一步失败（密码错误、页面要验证码、接口改版）才会退到 Selenium 自动点击。
+日志里对应的成功标志：
+
+```
+锐捷直连登录已提交（HTTP 200），等待网络恢复...
+锐捷直连登录成功，网络已恢复
+```
+
+> 页面里 `passwordEncrypt=false` 时（有些校区这么配）会自动改为明文提交，同样不需要浏览器。
+
 ### 方案 C：浏览器扩展（`extension/`，最轻量）
 
 不需要 Python、不需要驱动，认证页一打开就自动勾选并点击：
@@ -230,17 +253,17 @@ python auto_portal_auth.py install-extension
 
 ### 三套方案怎么选
 
-| | A. Selenium | B. HTTP 直连 | C. 浏览器扩展 |
-| --- | --- | --- | --- |
-| 依赖 | selenium + 浏览器驱动 | 无 | 无 |
-| 首次准备 | `driver --download`（需联网） | 无需 | 手工加载一次扩展 |
-| 速度 | 3–10 秒 | < 1 秒 | 页面打开即点 |
-| 能处理"连接"按钮 | ✅ | ❌ | ✅ |
-| 能处理复选框/弹窗/iframe | ✅ | 部分 | ✅ |
-| 能验证真的联网了 | ✅ | ✅ | ❌（只看页面） |
+| | A. Selenium | B. HTTP 直连 | B+. 锐捷直连 | C. 浏览器扩展 |
+| --- | --- | --- | --- | --- |
+| 依赖 | selenium + 浏览器驱动 | 无 | 无 | 无 |
+| 首次准备 | `driver --download`（需联网） | 无需 | 无需 | 手工加载一次扩展 |
+| 速度 | 3–10 秒 | < 1 秒 | ~1 秒 | 页面打开即点 |
+| 能处理"连接"按钮 | ✅ | ❌ | ✅（接口登录） | ✅ |
+| 能处理复选框/弹窗/iframe | ✅ | 部分 | ✅ | ✅ |
+| 能验证真的联网了 | ✅ | ✅ | ✅ | ❌（只看页面） |
 
 **推荐组合**：主程序开方案 A；同时装上扩展 C 作为双保险。
-即使某天驱动下载失败或 Portal 改版，扩展依然会把按钮点掉。
+锐捷 ePortal 会先走 B+（约 1 秒、不开窗口），失败才用 A。
 
 ### 命令
 
@@ -340,11 +363,12 @@ browser_automation:
 `AuthTrigger.trigger()` 的尝试顺序（前一步成功就停止）：
 
 ```
-1. auth.auto_login（HTTP 表单；锐捷 ePortal 由页面 JS 认证，会自动跳过）
-2. auth.trigger_commands（自定义命令）
-3. browser_automation（Selenium 填账号密码 + 勾选 + 点击）   ← 新增
-4. HTTP GET 认证页（建立会话）
-5. 打开默认浏览器（最后的兜底）
+1. 锐捷 ePortal 直连接口（~1 秒，无需浏览器；失败才继续）
+2. auth.auto_login（通用 HTTP 表单）
+3. auth.trigger_commands（自定义命令）
+4. browser_automation（Selenium 填账号密码 + 勾选 + 点击）
+5. HTTP GET 认证页（建立会话）
+6. 打开默认浏览器（最后的兜底）
 ```
 
 第 3 步成功后会**跳过**第 4、5 步，因此不会再多弹一个浏览器窗口。
@@ -568,6 +592,9 @@ Linux 想让服务在**未登录**时也运行：`sudo loginctl enable-linger $U
 | 认证页弹出了，但"连接"按钮还要人手点 | 这是本版本新增功能的靶心：确认 `browser_automation.enabled: true` 且 selenium 已安装。先用 `python auto_portal_auth.py autoclick --explain` 看是否能识别到按钮；识别不到就按[识别不到按钮怎么办](#识别不到按钮怎么办)补关键词 |
 | 锐捷 ePortal：按钮没有文字（`<a id="loginLink">` 里只有空 div） | 这种按钮的文字是背景图，早期版本按文本打分会识别不到。现在按 `id=loginLink` / `onclick=doauthen()` / `SLoginBtn` 识别，`--explain` 里应看到 `score >= 15`。同理，`连接网络` 这种标题文字（div/span）会被判为"非按钮"扣分，不会乱点 |
 | 点了登录但页面提示"请填写用户名/密码" | 页面需要真的填账号密码。确认 `auth.auto_login.enabled: true` 且 `username` / `password` 已填，`browser_automation.fill_credentials` 保持 true（默认）。日志里会打印"已填写登录账号「xxx」和密码（密码框可见=True）" |
+| 日志出现"锐捷直连登录被拒绝（...密码错误）" | 说明 B+ 直连接口已经通了，只是账号/密码不对。改好 `config.yaml` 里的 `auth.auto_login.password` 后重启程序即可。为防账号被锁，密码错误会把自动登录暂停 30 分钟（`auth.auto_login.fail_cooldown`），期间不会再反复试 |
+| 日志出现"锐捷直连登录未成功"但浏览器能手动登录 | 可能是接口改版或需要验证码。把日志里那条 HTTP 状态和 message 发出来即可；不影响 Selenium 兜底 |
+| 每次都要等 20~40 秒才连上 | 确认日志里有没有"锐捷直连登录已提交"。没有的话看上一行：直连失败才会启动浏览器（3~10 秒/次，还可能重试两轮） |
 | 改了代码/升级后仍旧要手动点 | 守护进程是常驻的，**启动时**就把代码读进内存了。改完代码必须重启：任务管理器结束 `pythonw.exe`，再重新运行（或注销重登，让自启项拉起新进程） |
 | 日志提示"未安装 selenium" | `python -m pip install selenium`，然后 `python auto_portal_auth.py driver --download` 预下载驱动（第一次需要联网） |
 | `driver --download` 失败 / 提示 Selenium Manager | 首次必须能上外网。可以在能上网的环境执行一次，驱动会缓存到 `~/.cache/selenium`；或改用扩展方案 C |

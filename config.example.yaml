@@ -97,6 +97,7 @@ auth:
     username_field_keywords: ["user", "name", "account", "acct", "login", "sid", "uid"]
     password_field_keywords: ["pass", "pwd", "password", "secret"]
     verify_timeout: 25            # 提交后等待联网成功的最大秒数
+    fail_cooldown: 1800           # 网关明确说密码错误时，暂停自动登录的秒数（防锁号）
 
   # ---- 心跳保活：定期发小请求，避免会话被空闲超时清理 --------------------
   keepalive:
@@ -136,6 +137,7 @@ browser_automation:
   dump_on_failure: true           # 失败时保存 HTML/截图，便于排查
   screenshot_on_failure: true
   dump_dir: "data/autoclick"
+  keep_failure_dumps: 10          # 只保留最近 N 次失败现场（截图+HTML）
   score_threshold: 5              # 低于该分数宁可不点，避免乱点
   fill_credentials: true          # 账号密码登录页：自动填入 auth.auto_login 的账号密码
   skip_terms_checkbox: false      # true = 不自动勾选服务条款
