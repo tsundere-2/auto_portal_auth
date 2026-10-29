@@ -1,0 +1,86 @@
+{
+  "artifacts": [
+    {
+      "artifact_id": "artifact_1ec70f425121d4284cc1a15e",
+      "current_revision_id": "revision_a771c8b62ef8bb5ca27a3a7d",
+      "filename": "auto_portal_auth.py",
+      "kind": "code",
+      "mime": "text/x-python",
+      "rel_path": "auto_portal_auth.py",
+      "revisions": [
+        {
+          "artifact_revision_id": "revision_9987a258fc573273eda83914",
+          "produced_at": "2026-10-29T17:56:34+08:00",
+          "sha256": "28600ff7dc1f18a3bc6f36e5a7b4c030a599471999d8b717b906ce998f59d56d",
+          "size": 151894,
+          "turn_id": "f26804a5-da3e-498b-b077-0fcd1833bb8b"
+        },
+        {
+          "artifact_revision_id": "revision_a771c8b62ef8bb5ca27a3a7d",
+          "produced_at": "2026-10-29T18:07:02+08:00",
+          "sha256": "8d265ef6b83f865a03cbde4ed1e9ef0bf23d717dd07efea8c8dfa9511577a64a",
+          "size": 156751,
+          "turn_id": "f26804a5-da3e-498b-b077-0fcd1833bb8b"
+        }
+      ]
+    },
+    {
+      "artifact_id": "artifact_d52c1142c89ac4f341c2b9a8",
+      "current_revision_id": "revision_96a23e2dc7919495ae8440ab",
+      "filename": "test_ruijie_login.py",
+      "kind": "code",
+      "mime": "text/x-python",
+      "rel_path": "tests/test_ruijie_login.py",
+      "revisions": [
+        {
+          "artifact_revision_id": "revision_96a23e2dc7919495ae8440ab",
+          "produced_at": "2026-10-29T18:08:09+08:00",
+          "sha256": "28cda14fea58fdf55f68d76f6d3ecfbf8bec801b401d94996797c8cfc2aebaf7",
+          "size": 18308,
+          "turn_id": "f26804a5-da3e-498b-b077-0fcd1833bb8b"
+        }
+      ]
+    },
+    {
+      "artifact_id": "artifact_1f79de90e208d88258621434",
+      "current_revision_id": "revision_584894178ff0f70ca629b85c",
+      "filename": "config.example.yaml",
+      "kind": "data",
+      "mime": "application/yaml",
+      "rel_path": "config.example.yaml",
+      "revisions": [
+        {
+          "artifact_revision_id": "revision_584894178ff0f70ca629b85c",
+          "produced_at": "2026-10-29T18:09:47+08:00",
+          "sha256": "22e45eabe4667aa100197e21a7ea3e2451b150040f8025ee9b908d2d6a063233",
+          "size": 9712,
+          "turn_id": "f26804a5-da3e-498b-b077-0fcd1833bb8b"
+        }
+      ]
+    },
+    {
+      "artifact_id": "artifact_a3e63e2d60b5c8e600b1bae2",
+      "current_revision_id": "revision_b62acc2eef4cc2abf82696a4",
+      "filename": "config.yaml",
+      "kind": "data",
+      "mime": "application/yaml",
+      "rel_path": "config.yaml",
+      "revisions": [
+        {
+          "artifact_revision_id": "revision_b62acc2eef4cc2abf82696a4",
+          "produced_at": "2026-10-29T18:09:47+08:00",
+          "sha256": "701b7db9c049d8e8cc79a55cfe3a278c7c53a3202c193c5186d847e682ccfe41",
+          "size": 9730,
+          "turn_id": "f26804a5-da3e-498b-b077-0fcd1833bb8b"
+        }
+      ]
+    }
+  ],
+  "created_at": "2026-10-29T09:49:53.574737+00:00",
+  "current_turn_id": "f26804a5-da3e-498b-b077-0fcd1833bb8b",
+  "execution_status": "completed",
+  "schema_version": 3,
+  "session_id": "82f396f5-73b1-479b-8d94-9944db396821",
+  "task_id": "82f396f5-73b1-479b-8d94-9944db396821",
+  "updated_at": "2026-10-29T10:14:03.656207+00:00"
+}

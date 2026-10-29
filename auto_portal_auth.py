@@ -42,6 +42,7 @@ import argparse
 import collections
 import copy
 import ctypes
+import gzip
 import ipaddress
 import json
 import logging
@@ -110,6 +111,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "log_backup_count": 5,
         "stats_file": "data/stats.json",
         "state_file": "data/state.json",
+        "portal_cache_file": "data/last_portal.json",   # 记住上次认证页，唤醒后抢在浏览器前登录
         "lock_file": "data/auto_portal_auth.lock",
         "single_instance": True,
         "hide_console": True,
@@ -163,8 +165,11 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "portal_interval": 8,      # 需要认证 / 尝试认证时的重试周期（秒）
         "link_down_interval": 5,   # 链路断开 / 无 IP 时的巡检周期（秒）
         "unknown_interval": 15,    # 状态未知（探测失败）时的周期
-        "wake_grace": 3,           # 唤醒后等待协议栈就绪的秒数
-        "wake_fast_probes": 12,    # 唤醒后快速探测的次数（每 2 秒一次）
+        "wake_grace": 1,           # 唤醒后等待协议栈就绪的秒数（越小越快，失败会自动快重试）
+        "wake_fast_probes": 12,    # 唤醒后快速重试次数（约每 1.5 秒一次）
+        "wake_preauth": True,      # 唤醒后先用上次的认证页地址直连登录（不等 DNS）
+        "wake_preauth_window": 25,  # 唤醒后抢跑窗口的秒数（这段时间内不快退、不误报断网）
+        "wake_unknown_tolerance": 30,  # 唤醒后多久内的探测失败不当成"断网"（秒）
         "backoff_max": 300,        # 认证失败时的最大退避周期
         "detect_sleep_skew": 5.0,  # 时钟差超过该值即认为发生过休眠（秒）
     },
@@ -467,6 +472,7 @@ class ProbeResult:
     elapsed_ms: int = 0
     detail: str = ""
     body_sample: str = ""
+    body_html: str = ""          # 完整认证页（body_sample 只有前 4000 字，锐捷的公钥在页面后段）
 
 
 @dataclass
@@ -798,6 +804,10 @@ class NetworkChecker:
         # 上一次 check() 抓到的认证页正文，供认证流程复用（省一次 GET）
         self._last_portal_url = ""
         self._last_portal_html = ""
+        # 唤醒后的"快重试"窗口里把超时压短，别让一次探测卡 3+5 秒
+        self.fast_probe = False
+        # 唤醒预认证：只用短超时，失败就下一轮，绝不让"抢跑"本身变成等待
+        self.quick_auth = False
         # 关键：忽略系统代理。校园网/公司网络里的 HTTP_PROXY 会把探测请求导向代理，
         # 导致我们看不到 Portal 的重定向。
         if cfg.get("detect.ignore_system_proxy", True):
@@ -808,6 +818,10 @@ class NetworkChecker:
             "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
             "Cache-Control": "no-cache",
             "Pragma": "no-cache",
+            # 关键：锐捷 ePortal 会把 Content-Encoding 写成 "gzip  "（多个空格），
+            # urllib3 认不出来就不解压，正文全是乱码，页面里的 RSA 公钥/服务名
+            # 都读不到。直接要求不压缩，从根上绕开。
+            "Accept-Encoding": "identity",
         })
 
     # ---- 物理链路 ---------------------------------------------------------
@@ -890,13 +904,90 @@ class NetworkChecker:
 
     # ---- HTTP 探测 --------------------------------------------------------
     def _timeout(self) -> Tuple[float, float]:
+        if getattr(self, "quick_auth", False):
+            # 网关在本地网段（10.10.9.9），正常 100ms 内就响应；
+            # 唤醒瞬间 DNS 刚起来，1s 连 / 1.5s 读足够重试很多轮
+            return (1.0, 1.5)
+        if getattr(self, "fast_probe", False):
+            return (1.0, 2.0)
         return (float(self.cfg.get("detect.connect_timeout", 3)),
                 float(self.cfg.get("detect.read_timeout", 5)))
 
-    def probe_target(self, target: Dict[str, Any], fetch_portal: bool = True) -> ProbeResult:
+    @staticmethod
+    def _body_text(resp) -> str:
+        """取响应正文，顺手处理网关的"畸形 gzip"。
+
+        锐捷 ePortal 的 Content-Encoding 写成 "gzip  "（带尾随空格），
+        urllib3 认不出来就不会解压，resp.text 直接是压缩后的乱码 ——
+        之前读不到页面里的 RSA 公钥、服务名，就是这里造成的。
+        """
+        raw = resp.content or b""
+        if raw[:2] == b"\x1f\x8b":
+            try:
+                raw = gzip.decompress(raw)
+            except Exception:
+                pass
+        # 编码以响应头为准，不用 requests 推断出来的（没有 charset 时它会猜成 ISO-8859-1）
+        for enc in ((getattr(resp, "encoding", None) or "").strip(), "utf-8", "gb18030"):
+            if not enc:
+                continue
+            try:
+                return raw.decode(enc)
+            except (LookupError, UnicodeDecodeError):
+                continue
+        return raw.decode("utf-8", "replace")
+
+    # ---- 瞬时故障判定（唤醒预认证用）-------------------------------------
+    @staticmethod
+    def _is_transient_error_text(text: str) -> bool:
+        """这个错误是"网络还没就绪"（DNS 没起来 / 连不上 / 超时），不是配置或密码错。
+
+        唤醒瞬间最常见的就是 getaddrinfo failed：此时 fast_probe 的 1s 超时还不够
+        DNS 服务起来，整体会很快判 unknown —— 那种情况值得多抢几轮。
+        """
+        t = (text or "").lower()
+        return any(k in t for k in (
+            "name or service not known", "getaddrinfo", "name resolution",
+            "temporary failure in name resolution", "failed to resolve",
+            "connection refused", "connection aborted", "connection reset",
+            "timed out", "timeout", "no route to host", "network is unreachable",
+            "proxy error", "remote end closed", "errno 10061", "errno 11001",
+        ))
+
+    def quick_probe_ip(self) -> str:
+        """极短超时（1s 连 / 1.5s 读）探测一次，返回 "ok" / "portal" / "transient"。
+
+        唤醒后专用：不等 DNS、不抓认证页、不算指纹，只回答"现在到底通不通"。
+        urllib3 的 DNS 解析不受 timeout 限制，所以用一个非阻塞 socket 先问 DNS；
+        解析不出来就直接算 transient，立刻去抢认证，不白等。
+        """
+        target = None
+        for t in (self.cfg.get("detect.probe_targets") or []):
+            if t.get("url") and str(t.get("url")).startswith("http://"):
+                target = t
+                break
+        if target is None:
+            return "transient"
+        try:
+            host = (urlparse(target["url"]).hostname or "")
+            if host and not re.fullmatch(r"[0-9.]+", host):
+                ip = socket.gethostbyname(host)
+                if not ip:
+                    return "transient"
+        except Exception:
+            return "transient"           # DNS 还没就绪
+        try:
+            res = self.probe_target(target, fetch_portal=False, timeout=(1.0, 1.5))
+        except Exception:
+            return "transient"
+        return "ok" if res.kind == "ok" else "portal"
+
+    def probe_target(self, target: Dict[str, Any], fetch_portal: bool = True,
+                     timeout: Optional[Tuple[float, float]] = None) -> ProbeResult:
         """探测单个目标，判定：ok / portal / error。
 
         fetch_portal=False 时不做"跟随跳转 + 抓认证页"（用于认证后的快速验证）。
+        timeout 可覆盖本次超时（唤醒后抢跑时用更短的）。
         """
         name = target.get("name") or target.get("url") or "?"
         url = target["url"]
@@ -905,7 +996,8 @@ class NetworkChecker:
         res = ProbeResult(target=name, url=url)
         started = time.time()
         try:
-            resp = self._session.get(url, timeout=self._timeout(), allow_redirects=False)
+            resp = self._session.get(url, timeout=timeout or self._timeout(),
+                                     allow_redirects=False)
         except Exception as exc:
             res.kind = "error"
             res.elapsed_ms = int((time.time() - started) * 1000)
@@ -923,16 +1015,18 @@ class NetworkChecker:
             res.detail = f"HTTP {resp.status_code} -> {res.final_url}"
             if fetch_portal and self.cfg.get("detect.probe_portal_page", True):
                 html = self._fetch_portal_page(res.final_url)
+                res.body_html = html
                 res.body_sample = html[:4000]
             return res
 
-        body = resp.text or ""
+        body = self._body_text(resp)
 
         # 情况 B：状态码不符（例如期望 204 却拿到 200 的认证页）
         if expect_status is not None and resp.status_code != expect_status:
             res.kind = "portal"
             res.final_url = resp.url
             res.detail = f"期望 HTTP {expect_status}，实际 {resp.status_code}（疑似认证页）"
+            res.body_html = body
             res.body_sample = body[:4000]
             return res
 
@@ -941,6 +1035,7 @@ class NetworkChecker:
             res.kind = "portal"
             res.final_url = resp.url
             res.detail = f"响应内容不含预期关键字 {expect_contains!r}"
+            res.body_html = body
             res.body_sample = body[:4000]
             return res
 
@@ -976,7 +1071,7 @@ class NetworkChecker:
         limit = int(self.cfg.get("detect.probe_portal_page_max_bytes", 256 * 1024))
         try:
             resp = self._session.get(url, timeout=self._timeout(), allow_redirects=True)
-            return (resp.text or "")[:limit]
+            return self._body_text(resp)[:limit]
         except Exception as exc:
             LOG.debug("抓取认证页失败 %s: %s", url, exc)
             return ""
@@ -1037,7 +1132,7 @@ class NetworkChecker:
             status.state = NetState.PORTAL_REQUIRED
             status.portal_url = portal_result.final_url or portal_result.url
             status.detail = portal_result.detail
-            html = portal_result.body_sample
+            html = portal_result.body_html or portal_result.body_sample
             if not html and self.cfg.get("detect.probe_portal_page", True):
                 html = self._fetch_portal_page(status.portal_url)
             # 探测地址常常只是"中间页"：正文里才有带 wlanuserip/mac 的
@@ -1247,12 +1342,45 @@ class AuthTrigger:
         data.update({str(k): str(v) for k, v in (al.get("extra_fields") or {}).items()})
         return data
 
-    def ruijie_login(self, status: NetStatus) -> bool:
+    def _ruijie_page_info(self, portal_url: str, query: str) -> Dict[str, Any]:
+        """调用锐捷 InterFace.do?method=pageInfo，拿 RSA 公钥等页面信息。
+
+        页面加载后本来就会调这个接口（静态 HTML 里的公钥可能是空的），
+        返回 JSON 里带 publicKeyExponent / publicKeyModulus / passwordEncrypt /
+        validCodeUrl / prefixValue。请求格式与页面一致：queryString 双重编码。
+        """
+        url = urljoin(portal_url, "InterFace.do?method=pageInfo")
+        body = "queryString=" + _js_encode(_js_encode(query))
+        try:
+            resp = self.checker._session.post(
+                url, data=body.encode("utf-8"),
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                    "Referer": portal_url,
+                    "X-Requested-With": "XMLHttpRequest",
+                },
+                timeout=self.checker._timeout(), allow_redirects=False)
+        except Exception as exc:
+            LOG.debug("锐捷 pageInfo 请求失败: %s", exc)
+            return {}
+        try:
+            info = json.loads((resp.content or b"").decode("utf-8", "replace"))
+        except Exception:
+            LOG.debug("锐捷 pageInfo 返回不是 JSON: %s",
+                      (resp.content or b"")[:80].decode("utf-8", "replace"))
+            return {}
+        return info if isinstance(info, dict) else {}
+
+    def ruijie_login(self, status: NetStatus, verify_seconds: Optional[float] = None,
+                     assume_success: bool = False) -> bool:
         """锐捷 ePortal：直接 POST InterFace.do?method=login。
 
         复刻页面 doauthen() 的请求（含 RSA 密码加密），约 1 秒完成，
         不需要启动浏览器，也不用等页面渲染。失败时静默返回 False，
         后面还有 Selenium 自动点击兜底。
+
+        verify_seconds: 覆盖"提交后等联网"的秒数（唤醒预认证时用短的）。
+        assume_success: 网关返回 success 就直接算成功（唤醒后 DNS 往往还没好）。
         """
         al = self.cfg.get("auth.auto_login") or {}
         if not al.get("enabled") or not al.get("username") or not al.get("password"):
@@ -1290,11 +1418,30 @@ class AuthTrigger:
         # 服务名（页面隐藏域 net_access_type，例如 "shu"）：漏掉它网关会认为
         # 登录的服务不对，直接返回失败。
         service = _input_value(html, "net_access_type")
+        if not service:
+            # 有些页面这个隐藏域是 JS 在 pageInfo 之后才填的；服务列表里
+            # 第一项就是默认的"校园网"。
+            m = re.search(r"""selectService\(\s*["']([^"']+)["']""", html)
+            if m:
+                service = m.group(1)
+                LOG.debug("锐捷服务名从服务列表推断: %s", service)
+        exponent = _input_value(html, "publicKeyExponent")
+        modulus = _input_value(html, "publicKeyModulus")
+        if not (exponent and modulus):
+            # 页面静态 HTML 里公钥有时是空的（由 JS 调 pageInfo 后填入），
+            # 这时直接问接口要，别急着退回浏览器。
+            info = self._ruijie_page_info(portal_url, query)
+            exponent = str(info.get("publicKeyExponent") or "")
+            modulus = str(info.get("publicKeyModulus") or "")
+            flag = str(info.get("passwordEncrypt") or "").lower()
+            if flag in ("true", "false"):
+                encrypt = flag
+            if info.get("validCodeUrl"):
+                LOG.info("锐捷认证页要求验证码，改用浏览器自动点击")
+                return False
         if encrypt == "true":
-            exponent = _input_value(html, "publicKeyExponent")
-            modulus = _input_value(html, "publicKeyModulus")
             if not (exponent and modulus):
-                LOG.debug("锐捷页面未提供 RSA 公钥，改用浏览器自动点击")
+                LOG.warning("锐捷页面未提供 RSA 公钥（pageInfo 也没有），改用浏览器自动点击")
                 return False
             try:
                 encrypted = ruijie_rsa_encrypt(
@@ -1325,10 +1472,14 @@ class AuthTrigger:
             resp = self.checker._session.post(
                 url, data=body.encode("utf-8"), headers=headers,
                 timeout=self.checker._timeout(), allow_redirects=False)
-            text = resp.text or ""
+            text = self.checker._body_text(resp)
         except Exception as exc:
             LOG.warning("锐捷直连登录请求失败: %s", exc)
             return False
+
+        if "已在线" in text or "already online" in text.lower():
+            LOG.info("锐捷直连：网关提示账号已在线，视为已认证")
+            return True
 
         if not re.search(r"""["']?result["']?\s*:\s*["']?success""", text):
             msg = re.search(r"""message\s*:\s*["']([^"']{0,120})""", text)
@@ -1342,8 +1493,13 @@ class AuthTrigger:
                 LOG.warning("锐捷直连登录未成功: HTTP %s %s", resp.status_code, detail)
             return False
 
+        if assume_success:
+            LOG.info("锐捷直连登录已被网关接受（唤醒预认证，不等 DNS 验证）")
+            return True
+
         LOG.info("锐捷直连登录已提交（HTTP %s），等待网络恢复...", resp.status_code)
-        timeout = min(float(al.get("verify_timeout", 25)), 12.0)
+        timeout = (float(verify_seconds) if verify_seconds is not None
+                   else min(float(al.get("verify_timeout", 25)), 12.0))
         deadline = time.time() + timeout
         while time.time() < deadline:
             if self.checker.is_online():
@@ -2052,6 +2208,18 @@ class AutoPortalAuth:
         self.keepalive_last = 0.0
         self.keepalive_interval = 0.0
         self._fail_streak = 0
+        self._last_resume_mono = 0.0      # 最近一次唤醒（monotonic，用于同一次唤醒去重）
+        self._last_resume_wall = 0.0      # 最近一次唤醒（wall clock，用于容忍唤醒后的探测失败）
+        self._wake_fast_left = 0          # 唤醒后还剩几次"快重试"（跨多轮休眠有效）
+        self._wake_unknown_logged = False  # 唤醒后的"还没就绪"是否已提示过（避免刷屏）
+        self._wake_preauth_ok = False      # 本次唤醒的预认证是否已成功
+        self._wake_preauth_tries = 0       # 本次唤醒已尝试预认证的次数（用于抑制重复日志）
+        self._wake_level = "quick"         # 本次唤醒的抢跑档位：quick（短超时）-> normal
+        self._wake_deadline = 0.0          # 本次唤醒的抢跑截止时刻（monotonic，兜底上限）
+        self._skip_tick = False            # 本轮跳过完整探测（抢跑窗口内 DNS 未就绪）
+        self._portal_cache_path = cfg.resolve_path(
+            cfg.get("app.portal_cache_file", "data/last_portal.json"))
+        self._portal_cache = self._load_portal_cache()
 
     # ---- 生命周期 ---------------------------------------------------------
     def install_signals(self) -> None:
@@ -2095,9 +2263,14 @@ class AutoPortalAuth:
 
         while not self.stop_event.is_set():
             interval = self._next_interval()
-            self._sleep(interval, wake_fast=True)
+            self._sleep(interval)
             if self.stop_event.is_set():
                 break
+            if self._skip_tick:
+                # 唤醒抢跑窗口里 DNS 还没起来，完整探测只会白等几个超时，
+                # 状态也不会变 —— 直接进入下一轮抢跑。
+                self._skip_tick = False
+                continue
             self._tick()
 
         self._end_session("program_exit")
@@ -2105,17 +2278,49 @@ class AutoPortalAuth:
         self.watcher.stop()
         LOG.info("已退出。")
 
-    def _sleep(self, seconds: float, wake_fast: bool = False) -> None:
+    def _sleep(self, seconds: float) -> None:
         """可中断休眠：同时监听停止信号与唤醒事件，唤醒后立即返回继续检测。"""
+        # 唤醒后的"抢跑窗口"（默认 25s）：这段时间里不被正常巡检周期拖住。
+        # 刚唤醒时 DNS/DHCP 往往还没就绪，等 15 秒再试就太慢了 ——
+        # 浏览器打开网页只要几百毫秒，慢一步就是用户看到认证页。
+        if self._wake_window_active():
+            self.checker.fast_probe = True          # 探测超时压到 1s/2s
+            self.checker.quick_auth = True          # 直连登录也只用 1s/1.5s
+            verdict = "transient"
+            try:
+                verdict = self.checker.quick_probe_ip()
+            except Exception as exc:
+                LOG.debug("唤醒快速探测异常: %s", exc)
+            if verdict == "ok":
+                LOG.info("唤醒后网络已可用")
+                self._end_wake_window()
+                seconds = 0.0
+            elif verdict == "portal":
+                # 已经是认证页：立刻交给正常认证流程（含浏览器兜底）
+                LOG.debug("唤醒快速探测已看到认证页，立即认证")
+                self._end_wake_window()
+                seconds = 0.0
+            elif self._wake_preauth():
+                seconds = 0.4                       # 已提交登录，短等 DNS/链路就绪
+                self._skip_tick = True
+            else:
+                seconds = 0.25                      # 还没就绪，连着抢，不空等
+                self._skip_tick = True
+        elif self._wake_fast_left > 0:
+            self._wake_fast_left -= 1
+            self.checker.fast_probe = True
+            seconds = min(seconds, 1.5)
+        else:
+            self.checker.fast_probe = False
+            self.checker.quick_auth = False
+            self._wake_level = "quick"
+
         end = time.monotonic() + seconds
-        fast_probes = int(self.cfg.get("monitor.wake_fast_probes", 0)) if wake_fast else 0
-        fast_used = 0
-        last_resume = float(getattr(self, "_last_resume_mono", 0.0))
         while not self.stop_event.is_set():
             remaining = end - time.monotonic()
             if remaining <= 0:
                 break
-            self.stop_event.wait(min(0.5, remaining))
+            self.stop_event.wait(min(0.5, remaining) if remaining > 0.05 else remaining)
             events = self.watcher.poll()
             if "suspend" in events and "resume" not in events:
                 # 休眠期间不做任何事，等唤醒事件
@@ -2123,21 +2328,107 @@ class AutoPortalAuth:
             if "resume" in events:
                 # 同一次唤醒可能被"时钟启发式"和"电源广播"各报一次，只处理第一次
                 now = time.monotonic()
-                if now - last_resume < 15:
+                if now - self._last_resume_mono < 15:
                     continue
-                last_resume = now
                 self._last_resume_mono = now
+                self._last_resume_wall = time.time()
                 self.after_wake = True
+                self._wake_fast_left = int(self.cfg.get("monitor.wake_fast_probes", 12))
+                self._wake_unknown_logged = False
+                self._wake_preauth_ok = False
+                self._wake_preauth_tries = 0
+                self._wake_level = "quick"
+                self._wake_deadline = now + max(
+                    3.0, float(self.cfg.get("monitor.wake_preauth_window", 25)))
+                self.checker.fast_probe = True
+                self.checker.quick_auth = True
                 self.stats.add_wake_event()
                 self.notifier.on_wake()
-                grace = float(self.cfg.get("monitor.wake_grace", 3))
-                LOG.info("系统已唤醒，%ss 后开始检测网络...", grace)
+                # 休眠中断的会话在这里收尾（不是 Portal 空闲超时，别污染统计）
+                self._end_session("sleep")
+                grace = float(self.cfg.get("monitor.wake_grace", 1))
+                LOG.info("系统已唤醒，%ss 后开始预认证/检测网络...", grace)
                 self.stop_event.wait(grace)
-                # 唤醒后前几次快速探测，尽快恢复网络
-                if fast_used < fast_probes:
-                    fast_used += 1
-                    return
-                end = time.monotonic() + 2.0
+                # 抢在浏览器前面：用缓存下来的认证页地址直连登录（网关 IP 直连，不需要 DNS）
+                self._wake_preauth()
+                return
+
+    # ---- 唤醒抢跑 ---------------------------------------------------------
+    def _wake_window_active(self) -> bool:
+        """是否仍在"唤醒后抢跑"窗口内（未被正常流程接管）。"""
+        return (self._wake_deadline > 0.0 and self.after_wake
+                and time.monotonic() < self._wake_deadline)
+
+    def _end_wake_window(self) -> None:
+        """结束抢跑窗口，交回正常巡检节奏。"""
+        self._wake_deadline = 0.0
+        self._wake_fast_left = 0
+        self.checker.quick_auth = False
+
+    def _wake_preauth(self) -> bool:
+        """唤醒后抢在浏览器之前，用上次缓存下来的认证页直连登录。
+
+        刚唤醒时 DNS 常常还没就绪（探测会直接报 DNS 错误），但锐捷网关是
+        IP 直连（10.10.9.9），只要本机 IP 没变，用缓存地址 POST 一次往往
+        1 秒内就能恢复，用户浏览器还没反应过来。
+
+        返回 True 表示"这次已经提交并被网关接受"，后续只需简短确认。
+        """
+        if self._wake_preauth_ok:
+            return True
+        if not self.cfg.get("monitor.wake_preauth", True):
+            return False
+        retry = self._wake_preauth_tries > 0
+        self._wake_preauth_tries += 1
+        log = LOG.debug if retry else LOG.info
+        cache = self._portal_cache or {}
+        url = str(cache.get("url") or "")
+        if not url:
+            log("唤醒预认证跳过：还没有缓存过认证页地址")
+            return False
+        if str(cache.get("vendor") or "") != "ruijie":
+            log("唤醒预认证跳过：上次的认证页不是锐捷（%s）", cache.get("vendor"))
+            return False
+        al = self.cfg.get("auth.auto_login") or {}
+        if not (al.get("enabled") and al.get("username") and al.get("password")):
+            log("唤醒预认证跳过：没有配置自动登录账号密码")
+            return False
+        if time.time() < self.trigger._auth_disabled_until:
+            return False
+
+        link = self.checker.link_info()
+        if not link.up or not link.has_ip or not link.primary_ip:
+            log("唤醒预认证跳过：网卡还没拿到 IP，等 DHCP")
+            return False
+        cached_ip = str(cache.get("ip") or "")
+        if cached_ip and cached_ip != link.primary_ip:
+            log("唤醒预认证跳过：本机 IP 变了（%s -> %s），按正常流程重新探测",
+                cached_ip, link.primary_ip)
+            self._end_wake_window()
+            return False
+
+        status = NetStatus(
+            state=NetState.PORTAL_REQUIRED, portal_url=url, local_ip=link.primary_ip,
+            interface=link.primary_iface,
+            fingerprint=Fingerprint(vendor="ruijie", confidence=1.0, portal_url=url),
+        )
+        log("唤醒预认证：用缓存的认证页直连登录（%s）", url.split("?")[0])
+        quick_was = self.checker.quick_auth
+        self.checker.quick_auth = True
+        try:
+            # 注意：ruijie_login 是 AuthTrigger 的方法（之前这里写成 self.ruijie_login，
+            # 直接 AttributeError 被 except 吞掉，抢跑从来没真正执行过）
+            ok = self.trigger.ruijie_login(status, verify_seconds=0.0, assume_success=True)
+        finally:
+            self.checker.quick_auth = quick_was
+        if ok:
+            self._wake_preauth_ok = True
+            self.trigger.successes += 1
+            self.stats.add_auth_result(True)
+            LOG.info("唤醒预认证成功（未等探测，浏览器不会先弹认证页）")
+            return True
+        log("唤醒预认证未成功，继续快重试/正常探测")
+        return False
 
     def _next_interval(self) -> float:
         state = self.status.state
@@ -2192,6 +2483,8 @@ class AutoPortalAuth:
     def _handle_online(self, status: NetStatus, prev: NetStatus, initial: bool) -> None:
         was_ok = prev.state is NetState.INTERNET_OK
         self._fail_streak = 0
+        self._wake_fast_left = 0          # 已恢复，不用再快重试
+        self.checker.fast_probe = False
         self.trigger._last_browser_url = ""   # 已恢复，允许下次用浏览器
 
         if self.session_start is None:
@@ -2244,10 +2537,20 @@ class AutoPortalAuth:
 
     def _handle_portal(self, status: NetStatus, prev: NetStatus, initial: bool) -> None:
         vendor = status.fingerprint.vendor if status.fingerprint else "unknown"
+        # 指纹可能是 None（探测没抓到认证页），此时照样按"上次见过的厂商"记缓存，
+        # 否则唤醒抢跑会因为 vendor 对不上而一直被跳过。
+        if status.fingerprint is None:
+            status.fingerprint = Fingerprint(
+                vendor=str((self._portal_cache or {}).get("vendor") or "unknown"),
+                confidence=0.5, portal_url=status.portal_url)
+        self._save_portal_cache(status, status.portal_url)
         # 区分"空闲超时"和"掉线后重新认证"：链路一直在，说明是会话被空闲清理
-        if prev.state is NetState.INTERNET_OK:
+        if prev.state is NetState.INTERNET_OK and not self.after_wake:
             LOG.warning("检测到 Portal 拦截（厂商=%s）：%s", vendor, status.detail)
             self._end_session("idle_timeout", status)
+        elif self.after_wake and prev.state is NetState.INTERNET_OK:
+            # 刚睡醒：会话已经按 "sleep" 收尾过，这里不该再报"空闲超时"
+            LOG.info("唤醒后需要重新认证（厂商=%s）", vendor)
         elif initial:
             LOG.warning("启动时检测到需要认证（厂商=%s）", vendor)
         else:
@@ -2257,9 +2560,14 @@ class AutoPortalAuth:
             LOG.warning("认证触发已被配置关闭（auth.enabled=false），仅报告状态")
             return
 
+        wake_was_open = self._wake_window_active()
         recovered = self.trigger.trigger(status)
 
         if recovered:
+            # 抢跑窗口里认证成功：会话按 "sleep" 收尾过了，这里补回来，
+            # 否则下次 _handle_online 会以为"没断过"，不发恢复通知也不记在线时长
+            if wake_was_open and self.session_start is None:
+                self.session_start = time.time()
             self._fail_streak = 0
             self.session_start = time.time()
             self.last_ok_ts = self.session_start
@@ -2272,6 +2580,7 @@ class AutoPortalAuth:
             self.notifier.on_success(status, downtime)
             LOG.info("认证成功，网络已恢复%s",
                      f"（中断 {human_duration(downtime)}）" if downtime else "")
+            self._end_wake_window()
             return
 
         self._fail_streak += 1
@@ -2290,6 +2599,22 @@ class AutoPortalAuth:
             LOG.debug("链路仍未恢复: %s", status.detail)
 
     def _handle_unknown(self, status: NetStatus, prev: NetStatus) -> None:
+        # 刚唤醒时 DNS/协议栈往往还没就绪，第一次探测失败是常态，不是真的断网：
+        # 不要结束会话、也别刷一屏警告，快重试几次就好。
+        since_wake = (time.time() - self._last_resume_wall) if self._last_resume_wall else None
+        tolerance = float(self.cfg.get("monitor.wake_unknown_tolerance", 30))
+        if since_wake is not None and since_wake < tolerance:
+            if not self._wake_unknown_logged:
+                self._wake_unknown_logged = True
+                LOG.info("唤醒后网络尚未就绪（%.1fs），快速重试中: %s", since_wake, status.detail)
+            else:
+                LOG.debug("唤醒后重试仍未就绪（%.1fs）: %s", since_wake, status.detail)
+            # 探测要等 DNS，直连登录不用 —— 每轮都抢一次
+            if self._wake_preauth():
+                # 网关已接受：下一轮只做一次短确认，别一直当"没就绪"
+                self._wake_deadline = min(
+                    self._wake_deadline or (time.monotonic() + 2.0), time.monotonic() + 2.0)
+            return
         if prev.state is NetState.INTERNET_OK:
             LOG.warning("网络探测异常（可能上游故障）: %s", status.detail)
             self._end_session("unknown", status)
@@ -2322,6 +2647,42 @@ class AutoPortalAuth:
         if analysis.get("suggested_keepalive"):
             LOG.info("空闲超时统计: 样本=%s 中位数=%ss 建议保活间隔=%ss",
                      analysis["samples"], analysis["median"], analysis["suggested_keepalive"])
+
+    # ---- 认证页缓存 -------------------------------------------------------
+    def _load_portal_cache(self) -> Dict[str, Any]:
+        path = self._portal_cache_path
+        try:
+            if path.exists():
+                data = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(data, dict) and data.get("url"):
+                    LOG.debug("已加载认证页缓存: %s (%s)", str(data.get("url")).split("?")[0],
+                              data.get("saved_at"))
+                    return data
+        except Exception as exc:
+            LOG.debug("读取认证页缓存失败: %s", exc)
+        return {}
+
+    def _save_portal_cache(self, status: NetStatus, portal_url: str = "") -> None:
+        """记住这次看到的认证页地址，下次唤醒可以不等探测直接登录。"""
+        if not portal_url:
+            return
+        payload = {
+            "url": portal_url,
+            "vendor": status.fingerprint.vendor if status.fingerprint else "",
+            "ip": status.local_ip or "",
+            "saved_at": now_iso(),
+        }
+        if self._portal_cache and all(
+                payload.get(k) == self._portal_cache.get(k) for k in ("url", "vendor", "ip")):
+            return
+        self._portal_cache = payload
+        try:
+            self._portal_cache_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._portal_cache_path.with_suffix(self._portal_cache_path.suffix + ".tmp")
+            tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp.replace(self._portal_cache_path)
+        except Exception as exc:
+            LOG.debug("写入认证页缓存失败: %s", exc)
 
     # ---- 状态文件 ---------------------------------------------------------
     def _write_state_file(self) -> None:

@@ -13,6 +13,7 @@ app:
   log_backup_count: 5             # 保留 5 个历史日志
   stats_file: data/stats.json
   state_file: data/state.json     # 当前状态快照，供其它程序/脚本读取
+  portal_cache_file: data/last_portal.json  # 记住上次的认证页地址，唤醒后抢在浏览器前登录
   lock_file: data/auto_portal_auth.lock
   single_instance: true           # 只允许一个实例运行
   hide_console: true              # 自启时使用 pythonw.exe / VBS 隐藏黑框
@@ -74,8 +75,12 @@ monitor:
   portal_interval: 8              # 需要认证时的重试周期（失败会指数退避）
   link_down_interval: 5           # 链路断开/无 IP 时的巡检周期
   unknown_interval: 15            # 状态未知时的巡检周期
-  wake_grace: 3                   # 唤醒后等待网卡就绪的秒数
-  wake_fast_probes: 12            # 唤醒后快速探测的次数（尽快恢复）
+  wake_grace: 1                   # 唤醒后等待网卡就绪的秒数（越小越快，失败会自动快重试）
+  wake_fast_probes: 12            # 唤醒后快速探测的次数（约每 1.5 秒一次）
+  wake_preauth: true              # 唤醒后先用上次的认证页地址直连登录（不等 DNS）
+  wake_preauth_window: 25         # 唤醒后抢跑窗口（秒）：这段时间内窄跑探测+连续抢登录，不误报断网
+                                  # 超过就交回正常巡检节奏（避免一直高频重试）
+  wake_unknown_tolerance: 30      # 唤醒后多久内的探测失败不当成"断网"（秒）
   backoff_max: 300                # 认证失败时的最大退避周期
   detect_sleep_skew: 5.0          # 时钟差值超过该值即判定发生过休眠
 

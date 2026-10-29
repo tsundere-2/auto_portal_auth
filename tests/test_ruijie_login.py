@@ -14,8 +14,11 @@ tests/test_ruijie_login.py —— 锐捷 ePortal 直连登录（不需要浏览�
 
 from __future__ import annotations
 
+import json
 import sys
+import tempfile
 import threading
+import time
 import unittest
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -57,6 +60,12 @@ class _FakeChecker:
 
     def _timeout(self):
         return (2, 3)
+
+    # 与 NetworkChecker._body_text 同语义：真实代码现在统一走它取正文，
+    # 假对象漏了就会让直连登录在 except 里静默失败（测试曾因此一直红）。
+    @staticmethod
+    def _body_text(resp):
+        return resp.text or ""
 
     def _fetch_portal_page(self, url: str) -> str:
         return self._session.get(url, timeout=self._timeout()).text
@@ -156,5 +165,249 @@ class TestRuijieLogin(unittest.TestCase):
             server.server_close()
 
 
+class _PageInfoHandler(BaseHTTPRequestHandler):
+    """静态页面里公钥是空的，只有 pageInfo 接口才给（和真实锐捷页面一致）。"""
+
+    paths: list = []
+    login_body = ""
+    pageinfo_body = ""
+
+    def log_message(self, *args):  # 静音
+        pass
+
+    def _send(self, payload: bytes, ctype: str) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def do_GET(self):
+        html = """<!DOCTYPE html><html><head><meta charset="utf-8"><title>上网认证</title></head>
+<body><form>
+<input id="passwordEncrypt" value="true" type="hidden">
+<input name="net_access_type" id="net_access_type" value="shu" type="hidden">
+<input id="publicKeyExponent" value="" type="hidden">
+<input id="publicKeyModulus" value="" type="hidden">
+</form></body></html>"""
+        self._send(html.encode("utf-8"), "text/html; charset=utf-8")
+
+    def do_POST(self):
+        parsed = urllib.parse.urlparse(self.path)
+        length = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(length).decode("utf-8")
+        type(self).paths.append((parsed.path, parsed.query))
+        if parsed.query == "method=pageInfo":
+            type(self).pageinfo_body = body
+            payload = json.dumps({
+                "passwordEncrypt": "true",
+                "publicKeyExponent": EXPONENT,
+                "publicKeyModulus": MODULUS,
+                "validCodeUrl": "",
+                "prefixValue": "shdx",
+            }).encode("utf-8")
+            self._send(payload, "application/json; charset=utf-8")
+            return
+        type(self).login_body = body
+        self.server.logged_in = True
+        self._send(b'{"result":"success","message":""}', "application/json; charset=utf-8")
+
+
+class TestRuijieLoginPageInfo(unittest.TestCase):
+    def test_pageinfo_fallback_when_static_html_has_no_keys(self):
+        """静态 HTML 没有公钥时必须去问 pageInfo，而不是退回浏览器。"""
+        _PageInfoHandler.paths = []
+        _PageInfoHandler.login_body = ""
+        _PageInfoHandler.pageinfo_body = ""
+        server = ThreadingHTTPServer(("127.0.0.1", 0), _PageInfoHandler)
+        server.logged_in = False
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        portal = (base + "/eportal/index.jsp?wlanuserip=59.79.4.243"
+                  "&mac=c85309dcd933&t=wireless-v2-plain")
+        try:
+            cfg = Config(data={
+                "auth": {"auto_login": {
+                    "enabled": True,
+                    "username": "25124308@campus",
+                    "password": "S3cret!pass",
+                    "verify_timeout": 5,
+                }},
+                "browser_automation": {"fill_credentials": True},
+            }, path=Path("."))
+            checker = _FakeChecker(base)
+            checker.is_online = lambda: bool(server.logged_in)
+            trigger = AuthTrigger(cfg, checker)
+
+            status = NetStatus(portal_url=portal, fingerprint=Fingerprint(vendor="ruijie"))
+            self.assertTrue(trigger.ruijie_login(status), "pageInfo 兜底后应能直连登录")
+
+            self.assertIn(("/eportal/InterFace.do", "method=pageInfo"), _PageInfoHandler.paths)
+            fields = dict(urllib.parse.parse_qsl(_PageInfoHandler.login_body,
+                                                 keep_blank_values=True))
+            self.assertEqual(fields["service"], "shu")
+            self.assertEqual(fields["passwordEncrypt"], "true")
+            # 密文必须是用 pageInfo 给的公钥算出来的
+            self.assertEqual(fields["password"], app.ruijie_rsa_encrypt(
+                "S3cret!pass>c85309dcd933"[::-1], EXPONENT, MODULUS))
+            # pageInfo 的 queryString 和登录一样是双重编码
+            self.assertTrue(_PageInfoHandler.pageinfo_body.startswith(
+                "queryString=wlanuserip%253D"), _PageInfoHandler.pageinfo_body[:60])
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
+class TestWakePreauth(unittest.TestCase):
+    """唤醒后先用缓存的认证页直连登录（不等 DNS 探测）。"""
+
+    PORTAL = ("http://10.10.9.9/eportal/index.jsp?wlanuserip=59.79.4.243"
+              "&mac=c85309dcd933&t=wireless-v2-plain")
+
+    def _make_auth(self, cache_ip: str, live_ip: str):
+        tmp = Path(tempfile.mkdtemp(prefix="apa-wake-"))
+        cfg = Config(data={
+            "app": {
+                "portal_cache_file": "last_portal.json",
+                "stats_file": "stats.json",
+                "state_file": "state.json",
+            },
+            "stats": {"enabled": False},
+            "auth": {"auto_login": {"enabled": True, "username": "u", "password": "p"}},
+            "browser_automation": {"fill_credentials": True},
+        }, path=tmp / "config.yaml")
+        (tmp / "last_portal.json").write_text(json.dumps({
+            "url": self.PORTAL, "vendor": "ruijie", "ip": cache_ip, "saved_at": "x",
+        }), encoding="utf-8")
+        auth = app.AutoPortalAuth(cfg)
+        auth.checker.link_info = lambda: app.LinkInfo(
+            up=True, interfaces={"以太网": [live_ip]}, primary_ip=live_ip,
+            primary_iface="以太网")
+        calls = []
+        # 实际调用点在 AuthTrigger 上（见 test_preauth_calls_trigger_not_self）
+        auth.trigger.ruijie_login = lambda status, **kw: calls.append((status, kw)) or True
+        return auth, calls
+
+    def test_preauth_uses_cached_url_when_ip_unchanged(self):
+        auth, calls = self._make_auth("59.79.4.243", "59.79.4.243")
+        auth._wake_preauth()
+        self.assertEqual(len(calls), 1, "IP 没变时应直接用缓存地址登录")
+        status, kwargs = calls[0]
+        self.assertEqual(status.portal_url, self.PORTAL)
+        self.assertEqual(status.fingerprint.vendor, "ruijie")
+        self.assertTrue(kwargs.get("assume_success"))
+        self.assertTrue(auth._wake_preauth_ok)
+        # 已经成功就不再重复抢跑
+        auth._wake_preauth()
+        self.assertEqual(len(calls), 1)
+
+    def test_preauth_skips_when_ip_changed(self):
+        auth, calls = self._make_auth("59.79.4.243", "59.79.4.250")
+        auth._wake_preauth()
+        self.assertEqual(calls, [], "IP 变了就不能用旧地址硬登，交给正常探测")
+
+    def test_preauth_skips_without_cache(self):
+        auth, calls = self._make_auth("59.79.4.243", "59.79.4.243")
+        auth._portal_cache = {}
+        auth._wake_preauth()
+        self.assertEqual(calls, [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestWakeRace(unittest.TestCase):
+    """唤醒后的"抢跑窗口"：不等完整探测就把认证提上去，且不误报断网。
+
+    复现的真实场景（日志 2026-10-29 14:27 / 17:45）：唤醒后 1 秒探测因 DNS
+    getaddrinfo failed 直接失败，旧逻辑当场 warning + 结束会话，然后等
+    15 秒才重新探测 —— 浏览器早就在弹认证页了。
+    """
+
+    def _make_auth(self, cache_ip: str = "59.79.4.243", live_ip: str = "59.79.4.243"):
+        tmp = Path(tempfile.mkdtemp(prefix="apa-race-"))
+        cfg = Config(data={
+            "app": {"portal_cache_file": "last_portal.json", "stats_file": "stats.json",
+                    "state_file": "state.json"},
+            "stats": {"enabled": False},
+            "auth": {"auto_login": {"enabled": True, "username": "u", "password": "p"}},
+            "monitor": {"wake_preauth_window": 5, "wake_grace": 0},
+        }, path=tmp / "config.yaml")
+        (tmp / "last_portal.json").write_text(json.dumps({
+            "url": TestWakePreauth.PORTAL, "vendor": "ruijie", "ip": cache_ip,
+            "saved_at": "x"}), encoding="utf-8")
+        auth = app.AutoPortalAuth(cfg)
+        auth.checker.link_info = lambda: app.LinkInfo(
+            up=True, interfaces={"以太网": [live_ip]}, primary_ip=live_ip,
+            primary_iface="以太网")
+        return auth
+
+    def _enter_wake(self, auth):
+        auth.after_wake = True
+        auth._last_resume_wall = time.time()
+        auth._wake_deadline = time.monotonic() + 5
+        auth._wake_preauth_ok = False
+
+    def test_dns_not_ready_still_preauths_and_skips_full_probe(self):
+        """DNS 还没起来：仍然直连登录，并且本轮跳过完整探测（省掉 8~15 秒空等）。"""
+        auth = self._make_auth()
+        self._enter_wake(auth)
+        auth.checker.quick_probe_ip = lambda: "transient"     # 模拟 DNS 未就绪
+        calls = []
+        auth.trigger.ruijie_login = lambda status, **kw: calls.append(kw) or True
+        auth.stats.add_auth_result = lambda ok: None
+
+        auth._sleep(30)          # 正常周期是 30s，抢跑窗口内必须缩短
+        self.assertEqual(len(calls), 1, "DNS 未就绪也必须抢一次直连登录")
+        self.assertTrue(calls[0].get("assume_success"))
+        self.assertTrue(auth._skip_tick, "抢跑后应跳过完整探测，避免空等")
+        self.assertTrue(auth._wake_window_active(), "窗口应继续开着等链路就绪")
+        self.assertLess(auth._wake_deadline - time.monotonic(), 5.0)
+
+    def test_preauth_calls_trigger_not_self(self):
+        """回归：_wake_preauth 曾经写成 self.ruijie_login（方法在 AuthTrigger 上），
+        AttributeError 被吞掉，抢跑从头到尾一次都没真正执行过。"""
+        auth = self._make_auth()
+        self.assertFalse(hasattr(auth, "ruijie_login"), "AutoPortalAuth 上不该有这个属性")
+        self._enter_wake(auth)
+        auth.checker.quick_probe_ip = lambda: "transient"
+        calls = []
+        auth.trigger.ruijie_login = (
+            lambda status, **kw: calls.append(kw) or True)
+        auth._sleep(30)
+        self.assertEqual(len(calls), 1, "必须真的调到 AuthTrigger.ruijie_login")
+        self.assertTrue(auth._wake_preauth_ok)
+
+    def test_wake_window_expires(self):
+        auth = self._make_auth()
+        self._enter_wake(auth)
+        auth._wake_deadline = time.monotonic() - 0.01
+        self.assertFalse(auth._wake_window_active(), "超时后必须交回正常节奏")
+
+    def test_ip_changed_hands_back_to_normal_flow(self):
+        auth = self._make_auth(cache_ip="59.79.4.10", live_ip="59.79.4.243")
+        self._enter_wake(auth)
+        auth.checker.quick_probe_ip = lambda: "transient"
+        calls = []
+        auth.trigger.ruijie_login = lambda status, **kw: calls.append(kw) or True
+        auth._sleep(30)
+        self.assertEqual(calls, [], "IP 变了不能拿旧地址瞎登录")
+        self.assertFalse(auth._wake_window_active(), "这种情况应立即改走正常探测")
+
+    def test_unknown_during_wake_does_not_end_session(self):
+        """唤醒后探测失败 = 还没就绪，不是断网：不许结束会话、不许发告警。"""
+        auth = self._make_auth()
+        self._enter_wake(auth)
+        auth._wake_preauth_ok = True
+        ended = []
+        auth._end_session = lambda reason, status=None: ended.append(reason)
+        offline = app.NetStatus(state=app.NetState.UNKNOWN, detail="DNS 解析失败")
+        prev = app.NetStatus(state=app.NetState.INTERNET_OK)
+        with self.assertLogs("portal", level="INFO") as captured:
+            auth._handle_unknown(offline, prev)
+        self.assertEqual(ended, [])
+        self.assertFalse([m for m in captured.output if "网络探测异常" in m],
+                         "唤醒窗口内不该出现'网络探测异常'告警")
+        self.assertTrue([m for m in captured.output if "尚未就绪" in m],
+                        "应该只提示一次'还没就绪'")
