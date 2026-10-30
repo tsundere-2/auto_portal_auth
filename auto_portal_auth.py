@@ -39,9 +39,11 @@ auto_portal_auth.py
 from __future__ import annotations
 
 import argparse
+import atexit
 import collections
 import copy
 import ctypes
+import faulthandler
 import gzip
 import ipaddress
 import json
@@ -50,11 +52,13 @@ import logging.handlers
 import os
 import platform
 import re
+import shutil
 import signal
 import socket
 import statistics
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import webbrowser
@@ -111,6 +115,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "log_backup_count": 5,
         "stats_file": "data/stats.json",
         "state_file": "data/state.json",
+        "crash_log_file": "logs/crash.log",  # 崩溃/未捕获异常/线程异常的完整栈
         "portal_cache_file": "data/last_portal.json",   # 记住上次认证页，唤醒后抢在浏览器前登录
         "lock_file": "data/auto_portal_auth.lock",
         "single_instance": True,
@@ -408,7 +413,76 @@ def setup_logging(cfg: Config, verbose: bool = False, level_override: Optional[s
 
 
 # ===========================================================================
-# 3. 数据结构
+# 3. 崩溃 / 异常退出诊断
+# ===========================================================================
+# 背景：2026-10-29 21:01 守护进程静默消失，日志戛然而止、没有 WER 记录，
+# 只能靠倒推系统事件才判断出"进程没了"。这个模块的目的就是让下次
+# 死掉时能直接看到死因，而不是再猜一遍。
+
+def install_crash_diagnostics(cfg: Config, crash_log: Optional[Path] = None) -> None:
+    """安装三层退出诊断，全部写入 logs/crash.log。
+
+    1. faulthandler：段错误 / abort / 栈溢出这类"Python 层抓不到"的硬崩溃，
+       会打印完整 Python 调用栈（这是唯一能抓到 native 崩溃的手段）。
+    2. excepthook：主线程未捕获异常。
+    3. threading.excepthook：后台线程（电源监听、Selenium）抛的异常。
+    另外挂一个 atexit 钩子，正常退出也会记一笔，便于区分"正常停"和"被杀"。
+    """
+    path = crash_log or cfg.resolve_path(
+        cfg.get("app.crash_log_file", "logs/crash.log"))
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        f = path.open("a", encoding="utf-8")
+    except Exception as exc:      # 日志目录不可写时不影响主功能
+        print(f"[!] 初始化崩溃日志失败: {exc}", file=sys.stderr)
+        return
+
+    # 1) 硬崩溃：保留全部线程栈
+    try:
+        faulthandler.enable(file=f, all_threads=True)
+    except Exception:
+        pass
+
+    def _stamp() -> str:
+        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    def _excepthook(exc_type, exc, tb):
+        import traceback
+        f.write(f"\n===== {_stamp()} 未捕获异常 pid={os.getpid()} =====\n")
+        traceback.print_exception(exc_type, exc, tb, file=f)
+        f.flush()
+        LOG.error("未捕获异常，详情见 %s", path)
+
+    def _thread_hook(args):
+        import traceback
+        if args.exc_type is SystemExit:
+            return
+        f.write(f"\n===== {_stamp()} 线程异常 {getattr(args.thread, 'name', '?')} "
+                f"pid={os.getpid()} =====\n")
+        traceback.print_exception(args.exc_type, args.exc_value,
+                                  args.exc_traceback, file=f)
+        f.flush()
+
+    sys.excepthook = _excepthook
+    try:
+        threading.excepthook = _thread_hook
+    except Exception:
+        pass
+
+    # 4) 正常退出也留一笔：没有这一笔又没崩溃记录 => 被外部强杀
+    def _on_exit():
+        try:
+            f.write(f"\n===== {_stamp()} 进程正常退出 pid={os.getpid()} =====\n")
+            f.flush()
+        except Exception:
+            pass
+
+    atexit.register(_on_exit)
+    LOG.debug("崩溃诊断已启用: %s", path)
+
+
+# ===========================================================================
+# 4. 数据结构
 # ===========================================================================
 class NetState(str, Enum):
     LINK_DOWN = "link_down"                # 物理链路未连接 / 无 IP
@@ -500,7 +574,7 @@ class NetStatus:
 
 
 # ===========================================================================
-# 4. HTML 解析：抓取登录表单 / meta refresh
+# 5. HTML 解析：抓取登录表单 / meta refresh
 # ===========================================================================
 class _FormParser(HTMLParser):
     """提取页面中的所有 form 及其 input/select 字段。"""
@@ -825,7 +899,26 @@ class NetworkChecker:
         })
 
     # ---- 物理链路 ---------------------------------------------------------
-    def link_info(self) -> LinkInfo:
+    def link_info(self, use_cache: bool = True) -> LinkInfo:
+        """读取链路信息（带 3 秒缓存）。
+
+        net_if_stats/net_if_addrs 单次约 12ms 且偶尔在 native 层崩溃，
+        而 30 秒巡检里会连调多次（探测、保活、预认证），缓存能省掉大半开销。
+        """
+        if use_cache:
+            now = time.monotonic()
+            cached = getattr(self, "_link_cache", None)
+            ttl = float(self.cfg.get("network.link_cache_seconds", 3.0))
+            if cached and now - cached[0] < ttl:
+                return cached[1]
+        info = self._link_info_uncached()
+        try:
+            self._link_cache = (time.monotonic(), info)
+        except Exception:
+            pass
+        return info
+
+    def _link_info_uncached(self) -> LinkInfo:
         info = LinkInfo()
         if psutil is None:
             # 没有 psutil 时退化：只要本机拿得到出口 IP 就认为链路可用
@@ -837,14 +930,27 @@ class NetworkChecker:
             return info
 
         ignore = [s.lower() for s in (self.cfg.get("network.ignore_interfaces") or [])]
-        try:
-            stats = psutil.net_if_stats()
-            addrs = psutil.net_if_addrs()
-        except Exception as exc:
-            LOG.debug("读取网卡信息失败: %s", exc)
+        # 枚举网卡偶尔会在 native 层崩（crash.log 里见过 psutil net_if_stats 的
+        # access violation）。连续失败 3 次就暂时停用枚举，只用出口 IP 判定，
+        # 避免在坏掉的接口上空转。
+        if getattr(self, "_enum_fail_streak", 0) >= 3:
             ip = self.local_outbound_ip()
             if ip:
                 info.up, info.primary_ip = True, ip
+                info.interfaces = {"<fallback>": [ip]}
+                info.primary_iface = "<fallback>"
+            return info
+        try:
+            stats = psutil.net_if_stats()
+            addrs = psutil.net_if_addrs()
+            self._enum_fail_streak = 0
+        except Exception as exc:
+            self._enum_fail_streak = getattr(self, "_enum_fail_streak", 0) + 1
+            LOG.debug("读取网卡信息失败(%s次): %s", self._enum_fail_streak, exc)
+            ip = self.local_outbound_ip()
+            if ip:
+                info.up, info.primary_ip = True, ip
+                info.primary_iface = "<fallback>"
             return info
 
         for name, st in stats.items():
@@ -893,6 +999,46 @@ class NetworkChecker:
         finally:
             if sock:
                 sock.close()
+
+    # ---- 网卡健康 ---------------------------------------------------------
+    def stale_ipv4_interfaces(self, quiet_seconds: float = 120.0) -> List[Dict[str, str]]:
+        """列出"有自动私有地址(169.254.x.x)且没有正常 IPv4"的网卡。
+
+        这类网卡说明 DHCP 没拿到租约（常见于休眠后 Wi-Fi 驱动没重连上），
+        它们不会进 link_info()，但会挂在系统里影响路由选择、拖慢 DNS，
+        也是"僵尸网卡"的来源。返回 [{'name': ..., 'ip': ...}]，供 --fix-adapters 使用。
+        """
+        if psutil is None:
+            return []
+        ignore = [s.lower() for s in (self.cfg.get("network.ignore_interfaces") or [])]
+        result: List[Dict[str, str]] = []
+        now = time.time()
+        try:
+            stats = psutil.net_if_stats()
+            addrs = psutil.net_if_addrs()
+        except Exception:
+            return []
+        for name, st in stats.items():
+            if any(pat in name.lower() for pat in ignore):
+                continue
+            ipv4 = [a.address for a in addrs.get(name, [])
+                    if a.family == socket.AF_INET]
+            good = [a for a in ipv4
+                    if not a.startswith("127.") and not a.startswith("169.254.")]
+            apipa = [a for a in ipv4 if a.startswith("169.254.")]
+            if not apipa or good:
+                continue
+            isup = bool(getattr(st, "isup", False))
+            # 网卡没启用却还挂着 169.254：属于系统残留地址（Tentative），
+            # 不影响当前联网，但会让网卡列表/路由判断变脏，清掉即可。
+            if not isup:
+                result.append({"name": name, "ip": apipa[0], "reason": "stale"})
+                continue
+            # 刚醒来 2 分钟内的 169.254 属于正常过渡（DHCP 还在协商），不当异常报
+            if now - getattr(st, "last_change", 0) < quiet_seconds:
+                continue
+            result.append({"name": name, "ip": apipa[0], "reason": "dhcp_failed"})
+        return result
 
     @staticmethod
     def dns_ok(host: str = "www.msftconnecttest.com") -> bool:
@@ -2741,9 +2887,14 @@ def prev_checked(prev: NetStatus) -> Optional[float]:
 # ===========================================================================
 # 12. 开机自启安装 / 卸载
 # ===========================================================================
-def autostart_command(cfg: Config, config_path: Optional[str]) -> Tuple[List[str], str]:
-    """返回 (命令参数列表, 用于展示的命令行字符串)。"""
-    exe = sys.executable
+def autostart_command(cfg: Config, config_path: Optional[str],
+                      python_exe: Optional[str] = None) -> Tuple[List[str], str]:
+    """返回 (命令参数列表, 用于展示的命令行字符串)。
+
+    python_exe：外部指定解释器（看门狗用 pick_daemon_python() 挑带 selenium 的那个）；
+    不传则用当前解释器，保持原有行为。
+    """
+    exe = python_exe or sys.executable
     if platform.system() == "Windows":
         # pythonw.exe 运行时不弹黑框
         cand = Path(exe).with_name("pythonw.exe")
@@ -3049,6 +3200,331 @@ def load_config_local_only(path: Optional[str]) -> Config:
     return Config(path=cfg_path)
 
 
+def _watchdog_task_name() -> str:
+    return "AutoPortalAuthWatchdog"
+
+
+def _watchdog_xml(command: str, workdir: str, interval_minutes: int,
+                  arguments: str = "-X utf8 watchdog") -> str:
+    """生成计划任务 XML。
+
+    关键三点（对应实战中"睡醒后没人拉起进程"的问题）：
+      * 多个触发器：登录时 + 每 N 分钟 + **唤醒时（BootTrigger 不行，用 EventTrigger
+        监听 Kernel-Power 107 恢复事件）**，保证一醒来就有人检查；
+      * 任务设置为"唤醒后立即运行"、"错过则尽快补跑"；
+      * 用 pythonw 静默运行，不弹黑框。
+    """
+    return f"""<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.3" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>AutoPortalAuth 看门狗：守护进程不在就拉起；唤醒后立即检查一次。</Description>
+    <URI>\\{_watchdog_task_name()}</URI>
+  </RegistrationInfo>
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+      <Delay>PT20S</Delay>
+    </LogonTrigger>
+    <TimeTrigger>
+      <Repetition>
+        <Interval>PT{interval_minutes}M</Interval>
+        <StopAtDurationEnd>false</StopAtDurationEnd>
+      </Repetition>
+      <StartBoundary>2026-01-01T00:00:00</StartBoundary>
+      <Enabled>true</Enabled>
+    </TimeTrigger>
+    <EventTrigger>
+      <Enabled>true</Enabled>
+      <Subscription>&lt;QueryList&gt;&lt;Query Id="0" Path="System"&gt;&lt;Select Path="System"&gt;*[System[Provider[@Name='Microsoft-Windows-Kernel-Power'] and (EventID=107 or EventID=131)]]&lt;/Select&gt;&lt;/Query&gt;&lt;/QueryList&gt;</Subscription>
+      <Delay>PT3S</Delay>
+    </EventTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>{_current_user()}</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT5M</ExecutionTimeLimit>
+    <Priority>7</Priority>
+    <RestartOnFailure>
+      <Interval>PT1M</Interval>
+      <Count>3</Count>
+    </RestartOnFailure>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>{_xml_escape(command)}</Command>
+      <Arguments>{_xml_escape(arguments)}</Arguments>
+      <WorkingDirectory>{_xml_escape(workdir)}</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>
+"""
+
+
+def _current_user() -> str:
+    try:
+        user = os.environ.get("USERNAME") or ""
+        domain = os.environ.get("USERDOMAIN") or ""
+        return f"{domain}\\{user}" if domain else user
+    except Exception:
+        return ""
+
+
+def _xml_escape(text: str) -> str:
+    return (str(text).replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;").replace('"', "&quot;"))
+
+
+def pick_daemon_python() -> str:
+    """挑一个"真正装了依赖"的解释器来跑守护进程。
+
+    坑点：本工具自身的运行时 Python 只带了最小依赖（没有 selenium），
+    直接 sys.executable 会把守护进程以"浏览器兜底不可用"的状态拉起来。
+    所以优先选：项目 venv > 系统 Python（selenium 可用）> 自身。
+    判断标准是能 import selenium —— 那才是完整功能所需的解释器。
+    """
+    root = Path(__file__).resolve().parent
+    candidates: List[str] = []
+    for venv in ("venv", ".venv"):
+        for exe in ("Scripts/pythonw.exe", "Scripts/python.exe"):
+            candidates.append(str(root / venv / exe))
+    # 常见系统安装位置 + PATH 里的 python
+    local = os.environ.get("LOCALAPPDATA") or ""
+    if local:
+        for ver in ("Python313", "Python312", "Python311"):
+            candidates.append(str(Path(local) / "Programs" / "Python" / ver / "pythonw.exe"))
+    found = shutil.which("pythonw.exe") or shutil.which("python.exe")
+    if found:
+        candidates.append(found)
+    candidates.append(sys.executable)
+
+    seen = set()
+    for exe in candidates:
+        path = Path(exe)
+        if not path.exists():
+            continue
+        key = str(path).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            exe_plain = path.with_name("python.exe") if path.name.startswith("pythonw") else path
+            if not exe_plain.exists():
+                continue
+            r = subprocess.run([str(exe_plain), "-c", "import selenium"],
+                               capture_output=True, timeout=15,
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            if r.returncode == 0:
+                LOG.debug("看门狗选用解释器（selenium 可用）: %s", path)
+                return str(path)
+        except Exception:
+            continue
+    LOG.warning("未找到装了 selenium 的解释器，退回当前解释器: %s", sys.executable)
+    return sys.executable
+
+
+def find_running_daemon(cfg: Config) -> Optional[int]:
+    """找到正在运行的守护进程 PID（读锁文件，并校验进程真的活着）。"""
+    lock_path = cfg.resolve_path(cfg.get("app.lock_file", "data/auto_portal_auth.lock"))
+    try:
+        if not lock_path.exists():
+            return None
+        pid = int((lock_path.read_text(encoding="utf-8") or "0").strip() or 0)
+    except Exception:
+        return None
+    return pid if SingleInstance._pid_alive(pid) else None
+
+
+def cmd_watchdog(cfg: Config, args) -> int:
+    """看门狗本体：守护进程不在就拉起。
+
+    设计要点：
+      * 只用"锁文件 + 进程存活"判断，不碰网络，秒级完成；
+      * 拉起后短暂等待确认，失败则重试（默认 3 次）；
+      * 被计划任务每 N 分钟 + 系统唤醒时触发，自身不常驻，零资源占用。
+    """
+    pid = find_running_daemon(cfg)
+    if pid:
+        print(f"守护进程在运行 (pid={pid})，无需处理。")
+        return 0
+    if getattr(args, "check", False):
+        print("守护进程未运行。")
+        return 1
+
+    args_list, pretty = autostart_command(cfg, args.config, python_exe=pick_daemon_python())
+    tries = max(1, int(getattr(args, "retries", 3) or 1))
+    for attempt in range(1, tries + 1):
+        print(f"[{attempt}/{tries}] 拉起守护进程: {pretty}")
+        try:
+            kwargs = {"close_fds": True}
+            if platform.system() == "Windows":
+                kwargs["creationflags"] = getattr(subprocess, "DETACHED_PROCESS", 0) | \
+                    getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            subprocess.Popen(args_list, cwd=str(Path(__file__).resolve().parent),
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             stdin=subprocess.DEVNULL, **kwargs)
+        except Exception as exc:
+            print(f"    启动失败: {exc}")
+        for _ in range(20):            # 最多等 6 秒
+            time.sleep(0.3)
+            pid = find_running_daemon(cfg)
+            if pid:
+                print(f"    [OK] 已拉起 (pid={pid})")
+                return 0
+        time.sleep(1)
+    print("    [FAIL] 多次尝试仍未拉起，请手动运行 `python auto_portal_auth.py run` 查看报错。")
+    return 1
+
+
+def cmd_watchdog_install(cfg: Config, args) -> int:
+    """把看门狗注册成 Windows 计划任务（登录 / 每 N 分钟 / 系统唤醒 三种触发）。"""
+    if platform.system() != "Windows":
+        print("该命令目前只支持 Windows。")
+        return 2
+    interval = max(1, int(getattr(args, "interval", 5) or 5))
+    python = Path(pick_daemon_python())
+    # 用 pythonw 启动，避免计划任务里闪黑框
+    pyw = python.with_name("pythonw.exe")
+    exe = pyw if pyw.exists() else python
+    script = Path(__file__).resolve()
+    workdir = str(script.parent)
+    command = f'"{exe}" "{script}"'
+    # 注意：参数里必须带 watchdog 子命令，否则计划任务会把 daemon 的 run 再起一遍
+    xml = _watchdog_xml(command, workdir, interval, arguments="-X utf8 watchdog")
+
+    tmp = Path(tempfile.gettempdir()) / "apa_watchdog.xml"
+    # schtasks 要求 UTF-16
+    tmp.write_text(xml, encoding="utf-16")
+    name = _watchdog_task_name()
+    try:
+        if getattr(args, "remove", False):
+            subprocess.run(["schtasks", "/Delete", "/TN", name, "/F"],
+                           capture_output=True)
+            print(f"已删除计划任务 {name}")
+            return 0
+        r = subprocess.run(["schtasks", "/Create", "/TN", name, "/XML", str(tmp), "/F"],
+                           capture_output=True, text=True, encoding="mbcs", errors="replace")
+        if r.returncode != 0:
+            err = (r.stdout or "") + (r.stderr or "")
+            print("创建计划任务失败：", err.strip())
+            if "拒绝访问" in err or "Access is denied" in err:
+                print("提示：需要以管理员身份运行一次本命令。")
+            return 1
+        print(f"已创建计划任务 {name}")
+        print(f"  触发：登录后 20 秒 / 每 {interval} 分钟 / 系统唤醒后 3 秒")
+        print(f"  命令：{command} watchdog")
+    finally:
+        try:
+            tmp.unlink()
+        except Exception:
+            pass
+
+    if not getattr(args, "no_start", False):
+        print("\n立即执行一次看门狗检查：")
+        return cmd_watchdog(cfg, args)
+    return 0
+
+
+def cmd_fix_adapters(cfg: Config, args) -> int:
+    """清理"拿到 169.254 自动私有地址"的僵尸网卡。
+
+    休眠唤醒后 Wi-Fi 驱动经常只完成重新关联、不做 DHCP，网卡就卡在
+    169.254.x.x。这类网卡不参与认定（link_info 会跳过），但仍挂在系统里
+    影响路由和 DNS 解析。修复顺序由轻到重：
+      1. ipconfig /renew（只续租，无感）
+      2. netsh 禁用 / 启用该网卡（会短暂断一下该网卡）
+    默认 --dry-run 只报告不动手，避免误伤正在用的链路。
+    """
+    checker = NetworkChecker(cfg)
+    stale = checker.stale_ipv4_interfaces()
+    print(f"检测到 {len(stale)} 个异常网卡（169.254 自动私有地址，DHCP 未成功）：")
+    for item in stale:
+        print(f"  - {item['name']}  {item['ip']}")
+    if not stale:
+        print("无需处理。")
+        return 0
+
+    names = [item["name"] for item in stale]
+    if args.only:
+        names = [n for n in names if any(k.lower() in n.lower() for k in args.only)]
+        if not names:
+            print("按 --only 过滤后没有需要处理的网卡。")
+            return 0
+
+    if getattr(args, "dry_run", False):
+        print("\n[dry-run] 未做任何改动。加 --apply 才会真正执行。")
+        return 0
+
+    ok, fail = [], []
+    reasons = {item["name"]: item.get("reason") for item in stale}
+    for name in names:
+        print(f"\n>>> 处理: {name}")
+        if reasons.get(name) == "stale":
+            # 网卡本身没启用，残留地址是系统留下的：直接删地址，不动网卡状态
+            subprocess.run(["netsh", "interface", "ip", "delete", "address",
+                            f"name={name}", "address=all"],
+                           capture_output=True,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            time.sleep(1)
+            if name not in [x["name"] for x in checker.stale_ipv4_interfaces()]:
+                print("    [OK] 残留地址已清除")
+                ok.append(name)
+            else:
+                print("    [FAIL] 残留地址仍在（可能需要管理员权限）")
+                fail.append(name)
+            continue
+        # 1) 续租：先试最轻的手段
+        r = subprocess.run(["ipconfig", "/renew", name], capture_output=True,
+                           text=True, encoding="mbcs", errors="replace",
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        print(f"    ipconfig /renew -> rc={r.returncode}")
+        time.sleep(2)
+        left = [x["name"] for x in checker.stale_ipv4_interfaces()]
+        if name not in left:
+            print(f"    [OK] {name} 已拿到正常地址")
+            ok.append(name)
+            continue
+        # 2) 重启网卡
+        for action in ("disable", "enable"):
+            subprocess.run(["netsh", "interface", "set", "interface",
+                            f"name={name}", f"admin={action}"],
+                           capture_output=True,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            time.sleep(3 if action == "disable" else 6)
+        left = [x["name"] for x in checker.stale_ipv4_interfaces()]
+        if name not in left:
+            print(f"    [OK] {name} 重启网卡后已恢复")
+            ok.append(name)
+        else:
+            print(f"    [FAIL] {name} 仍是 169.254，可能需要重装/更新驱动")
+            fail.append(name)
+
+    print(f"\n完成：成功 {len(ok)}，失败 {len(fail)}")
+    if fail:
+        print("失败项建议手动处理（设备管理器里禁用再启用，或更新驱动）：", ", ".join(fail))
+        return 2
+    return 0
+
+
 def cmd_driver(cfg: Config, args) -> int:
     """检查 / 预下载浏览器驱动。纯本地命令，不需要 requests 或 PyYAML。"""
     if portal_autoclick is None:
@@ -3235,6 +3711,25 @@ def build_parser() -> argparse.ArgumentParser:
                        help="初始化一次驱动（首次需要联网下载）")
     p_drv.add_argument("--headed", action="store_true", help="使用可见窗口测试")
 
+    p_fix = sub.add_parser("fix-adapters", parents=[common],
+                           help="清理拿到 169.254 地址的僵尸网卡（休眠后 DHCP 失败）")
+    p_fix.add_argument("--apply", dest="apply", action="store_true",
+                       help="真正执行修复（默认只报告）")
+    p_fix.add_argument("--dry-run", dest="dry_run", action="store_true", default=True,
+                       help="只报告，不改动（默认行为）")
+    p_fix.add_argument("--only", action="append", metavar="NAME",
+                       help="只处理名字包含该关键字的网卡，可重复")
+
+    p_wd = sub.add_parser("watchdog", parents=[common],
+                          help="看门狗：守护进程不在就拉起（供计划任务调用）")
+    p_wd.add_argument("--check", action="store_true", help="只检查，不拉起（未运行返回 1）")
+    p_wd.add_argument("--retries", type=int, default=3, help="拉起失败的重试次数")
+    p_wd.add_argument("--install", action="store_true",
+                      help="注册计划任务：登录 + 每 N 分钟 + 系统唤醒")
+    p_wd.add_argument("--remove", action="store_true", help="删除计划任务")
+    p_wd.add_argument("--interval", type=int, default=5, help="巡检间隔分钟数（默认 5）")
+    p_wd.add_argument("--no-start", action="store_true", help="安装后不立即检查")
+
     sub.add_parser("install-extension", parents=[common],
                    help="打开浏览器扩展管理页（方案 C）")
 
@@ -3249,11 +3744,19 @@ def main(argv: Optional[List[str]] = None) -> int:
     # driver 只需要 selenium（找浏览器、下载驱动），install-extension 只需要浏览器。
     # 放在 Config.load() 之前，避免"当前 Python 缺 PyYAML"时先打一条
     # "解析配置文件失败"的噪音，再被依赖检查挡住。
-    if command in ("driver", "install-extension"):
+    if command in ("driver", "install-extension", "fix-adapters", "watchdog"):
         cfg = load_config_local_only(args.config)
         setup_logging(cfg, verbose=args.verbose, level_override=args.log_level)
         if command == "driver":
             return cmd_driver(cfg, args)
+        if command == "fix-adapters":
+            if getattr(args, "apply", False):
+                args.dry_run = False
+            return cmd_fix_adapters(cfg, args)
+        if command == "watchdog":
+            if getattr(args, "remove", False) or getattr(args, "install", False):
+                return cmd_watchdog_install(cfg, args)
+            return cmd_watchdog(cfg, args)
         return cmd_install_extension()
 
     cfg = Config.load(args.config)
@@ -3386,6 +3889,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0 if result.success else 2
 
     # ---- run：常驻守护 ---------------------------------------------------
+    # 进程级退出诊断：硬崩溃(native)/未捕获异常/线程异常 全部落盘，
+    # 避免再出现"日志戛然而止、只能靠系统事件倒推死因"的情况。
+    install_crash_diagnostics(cfg)
+
     lock = None
     if cfg.get("app.single_instance", True) and not getattr(args, "no_lock", False):
         lock = SingleInstance(cfg.resolve_path(cfg.get("app.lock_file", "data/app.lock")))

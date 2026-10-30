@@ -12,7 +12,8 @@ app:
   log_max_bytes: 2097152          # 单个日志文件 2MB，超过即滚动
   log_backup_count: 5             # 保留 5 个历史日志
   stats_file: data/stats.json
-  state_file: data/state.json     # 当前状态快照，供其它程序/脚本读取
+  state_file: data/state.json  # 当前状态快照，供其它程序/脚本读取
+  crash_log_file: logs/crash.log  # 崩溃/未捕获异常/线程异常的完整栈（排查"进程静默消失"）
   portal_cache_file: data/last_portal.json  # 记住上次的认证页地址，唤醒后抢在浏览器前登录
   lock_file: data/auto_portal_auth.lock
   single_instance: true           # 只允许一个实例运行

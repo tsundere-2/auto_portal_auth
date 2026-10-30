@@ -124,6 +124,9 @@ pythonw auto_portal_auth.py run
 | `driver` | 检查浏览器与驱动；`--download` 预下载驱动（首次需联网）。纯本地命令，不依赖 requests / PyYAML，并会打印驱动版本与当前解释器路径 |
 | `install-extension` | 打开浏览器扩展管理页并显示 `extension/` 目录（方案 C） |
 | `selftest` | 内置自检：用锐捷 / Dr.COM / 深澜 / H3C 等样例页面验证指纹识别 |
+| `watchdog` | 看门狗：守护进程不在就拉起。`--check` 只检查（未运行返回 1）、`--retries N` 重试次数 |
+| `watchdog --install` | 注册 Windows 计划任务：**登录后 20 秒 + 每 N 分钟 + 系统唤醒后 3 秒**都检查一次。`--interval 5` 设巡检分钟数、`--remove` 删除、`--no-start` 安装后不立即检查。需要管理员权限执行一次 |
+| `fix-adapters` | 清理拿到 `169.254.x.x` 的僵尸网卡（休眠后 DHCP 失败 / 未启用网卡残留地址）。默认只报告，`--apply` 才动手（先 `ipconfig /renew`，失败再重启网卡）；`--only WLAN` 限定关键字 |
 
 通用参数：`-c/--config 路径`、`-v/--verbose`、`--log-level DEBUG`。
 
@@ -589,6 +592,8 @@ Linux 想让服务在**未登录**时也运行：`sudo loginctl enable-linger $U
 | 显示需要认证但 `portal_url` 为空 | 认证服务器返回的是非 HTTP 响应（如 ICMP 重定向）或页面为空白。把 `detect.probe_portal_page` 保持 true，并检查 `portal_max_hops` |
 | 判定为"正常"但其实打不开网页 | 你的探测目标被劫持成了"看起来正常"的页面。加一个 `expect_contains` 更严格的目标，或加 HTTPS 目标 |
 | 自动登录总是失败 | 页面依赖 JS 加密（如深澜的 `SHA1` 混淆）或需要验证码。此时把 `auto_login.enabled` 关掉，改用 `open_browser`，或写自定义脚本挂到 `auth.trigger_commands` |
+| **睡醒后浏览器先弹认证页 / 守护进程"自己没了"** | ① 先看 `logs/crash.log`：有 `fatal exception` 说明是 native 层崩溃，栈里会指出崩在哪一行（本项目实测过 `socket.getaddrinfo` 和 `psutil.net_if_stats` 两处 access violation，后者已加缓存降级）；没有记录说明是**外部强杀**（任务管理器/安全软件/系统回收）。<br>② 装看门狗兜底：管理员权限执行一次 `python auto_portal_auth.py watchdog --install`，之后登录/每 5 分钟/系统唤醒都会检查进程是否还在，不在就拉起。<br>③ 唤醒仍弹页但进程正常：确认 `monitor.wake_preauth: true`、`data/last_portal.json` 存在且 `ip` 与当前一致（IP 变了会主动放弃抢跑，改走正常探测）。 |
+| **网卡停在 169.254.x.x** | 休眠后 Wi-Fi 驱动没做 DHCP。跑 `python auto_portal_auth.py fix-adapters` 先看报告，确认后加 `--apply` 修复（会先 `ipconfig /renew`，失败再重启该网卡；处理期间该网卡会短暂断开） |
 | 认证页弹出了，但"连接"按钮还要人手点 | 这是本版本新增功能的靶心：确认 `browser_automation.enabled: true` 且 selenium 已安装。先用 `python auto_portal_auth.py autoclick --explain` 看是否能识别到按钮；识别不到就按[识别不到按钮怎么办](#识别不到按钮怎么办)补关键词 |
 | 锐捷 ePortal：按钮没有文字（`<a id="loginLink">` 里只有空 div） | 这种按钮的文字是背景图，早期版本按文本打分会识别不到。现在按 `id=loginLink` / `onclick=doauthen()` / `SLoginBtn` 识别，`--explain` 里应看到 `score >= 15`。同理，`连接网络` 这种标题文字（div/span）会被判为"非按钮"扣分，不会乱点 |
 | 点了登录但页面提示"请填写用户名/密码" | 页面需要真的填账号密码。确认 `auth.auto_login.enabled: true` 且 `username` / `password` 已填，`browser_automation.fill_credentials` 保持 true（默认）。日志里会打印"已填写登录账号「xxx」和密码（密码框可见=True）" |
