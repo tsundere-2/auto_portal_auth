@@ -295,7 +295,7 @@ class TestWakePreauth(unittest.TestCase):
         status, kwargs = calls[0]
         self.assertEqual(status.portal_url, self.PORTAL)
         self.assertEqual(status.fingerprint.vendor, "ruijie")
-        self.assertTrue(kwargs.get("assume_success"))
+        self.assertTrue(kwargs.get("skip_verify"))
         self.assertTrue(auth._wake_preauth_ok)
         # 已经成功就不再重复抢跑
         auth._wake_preauth()
@@ -311,10 +311,6 @@ class TestWakePreauth(unittest.TestCase):
         auth._portal_cache = {}
         auth._wake_preauth()
         self.assertEqual(calls, [])
-
-
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
 
 
 class TestWakeRace(unittest.TestCase):
@@ -360,7 +356,7 @@ class TestWakeRace(unittest.TestCase):
 
         auth._sleep(30)          # 正常周期是 30s，抢跑窗口内必须缩短
         self.assertEqual(len(calls), 1, "DNS 未就绪也必须抢一次直连登录")
-        self.assertTrue(calls[0].get("assume_success"))
+        self.assertTrue(calls[0].get("skip_verify"))
         self.assertTrue(auth._skip_tick, "抢跑后应跳过完整探测，避免空等")
         self.assertTrue(auth._wake_window_active(), "窗口应继续开着等链路就绪")
         self.assertLess(auth._wake_deadline - time.monotonic(), 5.0)
@@ -411,3 +407,208 @@ class TestWakeRace(unittest.TestCase):
                          "唤醒窗口内不该出现'网络探测异常'告警")
         self.assertTrue([m for m in captured.output if "尚未就绪" in m],
                         "应该只提示一次'还没就绪'")
+
+
+class _AlreadyOnlineHandler(BaseHTTPRequestHandler):
+    """网关返回"已在线"，但（可配置）实际并不通。"""
+
+    online = False
+    paths: list = []
+
+    def log_message(self, *args):
+        pass
+
+    def do_GET(self):
+        html = f"""<!DOCTYPE html><html><head><meta charset="utf-8"><title>上网认证</title></head>
+<body><form>
+<input id="passwordEncrypt" value="true" type="hidden">
+<input name="net_access_type" id="net_access_type" value="shu" type="hidden">
+<input id="publicKeyExponent" value="{EXPONENT}" type="hidden">
+<input id="publicKeyModulus" value="{MODULUS}" type="hidden">
+</form></body></html>"""
+        data = html.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        self.rfile.read(length)
+        type(self).paths.append(self.path)
+        payload = '{"result":"fail","message":"已在线"}'.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+
+class TestNoFalseSuccess(unittest.TestCase):
+    """核心回归：任何"网关说成功"都不许直接当成"能上网"。
+
+    用户投诉的"睡醒后显示已连接、实际没网"就来自这种误判：网关回了
+    "已在线"（旧 MAC 的会话还挂着），程序或用户都以为好了，实际流量照样被拦。
+    """
+
+    def _run(self, online: bool):
+        server = ThreadingHTTPServer(("127.0.0.1", 0), _AlreadyOnlineHandler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        portal = (base + "/eportal/index.jsp?wlanuserip=59.79.4.243"
+                  "&mac=c85309dcd933&t=wireless-v2-plain")
+        try:
+            cfg = Config(data={
+                "auth": {"auto_login": {
+                    "enabled": True, "username": "25124308", "password": "S3cret!pass",
+                    "verify_timeout": 1,
+                }},
+                "browser_automation": {"fill_credentials": True},
+            }, path=Path("."))
+            checker = _FakeChecker(base)
+            trigger = AuthTrigger(cfg, checker)
+            checker.is_online = lambda: bool(online)
+            status = NetStatus(portal_url=portal,
+                              fingerprint=Fingerprint(vendor="ruijie"))
+            return trigger.ruijie_login(status, verify_seconds=0.3), trigger
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_already_online_but_offline_is_failure(self):
+        ok, trigger = self._run(online=False)
+        self.assertFalse(ok, "网关说'已在线'但探测不通，必须返回失败")
+        self.assertFalse(trigger.last_login_verified)
+
+    def test_already_online_and_verified_is_success(self):
+        ok, trigger = self._run(online=True)
+        self.assertTrue(ok)
+        self.assertTrue(trigger.last_login_verified)
+
+
+class TestQuickProbe(unittest.TestCase):
+    def test_probe_error_is_transient_not_portal(self):
+        """连接超时/拒绝是"暂时没通"，不是"看到认证页" —— 否则会提前结束抢跑。"""
+        cfg = Config(data={
+            "detect": {"probe_targets": [
+                {"name": "dead", "url": "http://127.0.0.1:1/nope", "expect_status": 200}
+            ]},
+        }, path=Path("."))
+        checker = app.NetworkChecker(cfg)
+        self.assertEqual(checker.quick_probe_ip(), "transient")
+
+
+class TestWatchdogHeartbeat(unittest.TestCase):
+    def test_heartbeat_age_from_state_file(self):
+        tmp = Path(tempfile.mkdtemp(prefix="apa-hb-"))
+        cfg = Config(data={
+            "app": {"state_file": "state.json"}, "stats": {"enabled": False},
+        }, path=tmp / "config.yaml")
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(time.time() - 42))
+        (tmp / "state.json").write_text(json.dumps({"heartbeat": stamp}), encoding="utf-8")
+        age = app.daemon_heartbeat_age(cfg)
+        self.assertIsNotNone(age)
+        self.assertGreaterEqual(age, 40)
+        self.assertLess(age, 120)
+
+    def test_heartbeat_age_missing_file(self):
+        tmp = Path(tempfile.mkdtemp(prefix="apa-hb2-"))
+        cfg = Config(data={"app": {"state_file": "nope.json"}}, path=tmp / "config.yaml")
+        self.assertIsNone(app.daemon_heartbeat_age(cfg))
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
+
+
+class TestConnectedButNoNet(unittest.TestCase):
+    """回归：长时间睡眠唤醒后"显示已连接、实际没网"。
+
+    两个具体漏洞：
+      1. check() 曾经"任意一个探测目标通过就 OK" —— 唤醒后网关半通
+         （DNS 有缓存 / 只放行个别域名）会被误判成在线，于是永远不再认证；
+      2. _handle_unknown 超过 wake_unknown_tolerance 后只打日志、什么都不做，
+         再也没有恢复路径。
+    """
+
+    def _checker(self):
+        cfg = Config(data={"detect": {"probe_targets": [
+            {"name": "a", "url": "http://a/x", "expect_status": 200},
+            {"name": "b", "url": "http://b/x", "expect_status": 204},
+            {"name": "c", "url": "http://c/x", "expect_status": 204},
+        ]}}, path=Path(tempfile.mkdtemp()) / "c.yaml")
+        c = app.NetworkChecker(cfg)
+        c.link_info = lambda use_cache=True: app.LinkInfo(
+            up=True, interfaces={"<outbound>": ["59.79.4.243"]},
+            primary_ip="59.79.4.243", primary_iface="<outbound>")
+        return c
+
+    def test_single_target_ok_is_not_online(self):
+        """只有 1/3 目标通过时必须判 unknown，不能报 internet_ok。"""
+        c = self._checker()
+
+        def probe(target, fetch_portal=True, timeout=None):
+            if target["name"] == "a":
+                return app.ProbeResult(target="a", url=target["url"], kind="ok",
+                                       status_code=200, detail="HTTP 200 OK")
+            return app.ProbeResult(target=target["name"], url=target["url"],
+                                   kind="error", detail="ConnectTimeout")
+
+        c.probe_target = probe
+        st = c.check()
+        self.assertIs(st.state, app.NetState.UNKNOWN)
+        self.assertIn("1/3", st.detail, "应说明只有少数目标通过")
+
+    def test_majority_ok_is_online(self):
+        """2/3 通过才算真的在线（正常网络下探测目标是全通的）。"""
+        c = self._checker()
+
+        def probe(target, fetch_portal=True, timeout=None):
+            if target["name"] in ("a", "b"):
+                return app.ProbeResult(target=target["name"], url=target["url"],
+                                       kind="ok", status_code=200, detail="OK")
+            return app.ProbeResult(target=target["name"], url=target["url"],
+                                   kind="error", detail="ConnectTimeout")
+
+        c.probe_target = probe
+        self.assertIs(c.check().state, app.NetState.INTERNET_OK)
+
+    def test_all_ok_is_online(self):
+        c = self._checker()
+        c.probe_target = lambda t, fetch_portal=True, timeout=None: app.ProbeResult(
+            target=t["name"], url=t["url"], kind="ok", status_code=200, detail="OK")
+        self.assertIs(c.check().state, app.NetState.INTERNET_OK)
+
+    def test_unknown_after_wake_window_still_selfchecks_portal(self):
+        """超过 30 秒容忍窗口、又拿不到探测结果时，必须主动去问 Portal 网关。
+
+        之前这里只打一条日志就结束，导致"睡醒后一直没网且永不恢复"。
+        """
+        tmp = Path(tempfile.mkdtemp(prefix="apa-self-"))
+        cfg = Config(data={
+            "app": {"portal_cache_file": "p.json", "stats_file": "s.json",
+                    "state_file": "st.json"},
+            "stats": {"enabled": False},
+            "monitor": {"wake_unknown_tolerance": 30},
+            "auth": {"auto_login": {"enabled": True, "username": "u", "password": "p"}},
+        }, path=tmp / "c.yaml")
+        (tmp / "p.json").write_text(json.dumps({
+            "url": TestWakePreauth.PORTAL, "vendor": "ruijie",
+            "ip": "59.79.4.243", "saved_at": "x"}), encoding="utf-8")
+
+        auth = app.AutoPortalAuth(cfg)
+        auth.checker.link_info = lambda use_cache=True: app.LinkInfo(
+            up=True, interfaces={"<outbound>": ["59.79.4.243"]},
+            primary_ip="59.79.4.243", primary_iface="<outbound>")
+        auth.checker._fetch_portal_page = lambda url: "<html>eportal login</html>"
+        auth._last_resume_wall = time.time() - 3600      # 远超容忍窗口
+        auth._last_selfcheck = 0.0
+        handled = []
+        auth._handle_portal = lambda s, p, i: handled.append(s.portal_url)
+
+        offline = app.NetStatus(state=app.NetState.UNKNOWN, detail="DNS 解析失败")
+        prev = app.NetStatus(state=app.NetState.INTERNET_OK)
+        auth._handle_unknown(offline, prev)
+        self.assertEqual(len(handled), 1, "应主动判定为需要认证并交给认证流程")
+        self.assertIn("eportal", handled[0])

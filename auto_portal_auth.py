@@ -118,6 +118,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "crash_log_file": "logs/crash.log",  # 崩溃/未捕获异常/线程异常的完整栈
         "portal_cache_file": "data/last_portal.json",   # 记住上次认证页，唤醒后抢在浏览器前登录
         "lock_file": "data/auto_portal_auth.lock",
+        "watchdog_lock_file": "data/watchdog.lock",     # 常驻看门狗的单实例锁
         "single_instance": True,
         "hide_console": True,
     },
@@ -164,6 +165,18 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "docker", "veth", "tap", "tun", "bluetooth", "teredo",
             "isatap", "wsl", "npcap", "wan miniport",
         ],
+        # 网卡枚举方式：
+        #   safe = 只用"出口 IP"判断链路可用（不调用 psutil 枚举）。
+        #          极少数网卡驱动会让 psutil 在 native 层 access violation，
+        #          这种崩溃 try/except 抓不到，会把整个守护进程直接打死。
+        #   full = 额外枚举所有网卡（能显示网卡名、区分"网线没插"和"DHCP 没完成"）。
+        # 默认 safe：守护进程的可靠性优先；需要看网卡明细时用 fix-adapters / status。
+        "adapter_enum": "safe",
+        # 探测持续失败时，直接问这些网关地址是否存在认证页（IP 直连，不依赖 DNS）。
+        # 命中后会自动接管为 portal_required 并触发认证。
+        "portal_guess_urls": ["http://10.10.9.9/eportal/index.jsp"],
+        # 链路信息缓存秒数（一次巡检里会多次询问链路状态）
+        "link_cache_seconds": 3.0,
     },
     "monitor": {
         "interval": 30,            # 网络正常时的巡检周期（秒）
@@ -173,6 +186,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "wake_grace": 1,           # 唤醒后等待协议栈就绪的秒数（越小越快，失败会自动快重试）
         "wake_fast_probes": 12,    # 唤醒后快速重试次数（约每 1.5 秒一次）
         "wake_preauth": True,      # 唤醒后先用上次的认证页地址直连登录（不等 DNS）
+        "wake_preauth_retry": 2.0,  # 预认证失败后至少间隔多少秒再提交（防止刷爆网关/锁号）
+        "wake_preauth_rearm": 8.0,  # 网关接受了但一直没网时，过多少秒再抢一次
         "wake_preauth_window": 25,  # 唤醒后抢跑窗口的秒数（这段时间内不快退、不误报断网）
         "wake_unknown_tolerance": 30,  # 唤醒后多久内的探测失败不当成"断网"（秒）
         "backoff_max": 300,        # 认证失败时的最大退避周期
@@ -258,6 +273,17 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "min_samples": 3,        # 至少多少个样本才敢给保活建议
         "min_seconds": 60,       # 小于该时长不认为是"空闲超时"（可能只是抖动）
         "max_seconds": 12 * 3600,
+    },
+    # -------------------------------------------------------------------
+    # 常驻看门狗（用户级，不需要管理员）：保证守护进程"死了会被拉起来"。
+    # 之前的计划任务方案需要管理员权限，装不上就等于没有保护 ——
+    # 所以默认用 HKCU Run + 常驻循环的兜底方案。
+    # -------------------------------------------------------------------
+    "watchdog": {
+        "interval": 60,         # 常驻看门狗的检查间隔（秒）
+        "stale_seconds": 180,   # 状态文件超过该秒数没更新 = 进程卡死，强制重启
+        "restart_backoff": 30,  # 两次重启之间的最小间隔（秒），避免疯狂重启
+        "max_restarts_per_hour": 20,   # 每小时最多重启几次（防止启动即崩的死循环刷屏）
     },
 }
 
@@ -865,6 +891,11 @@ def ruijie_rsa_encrypt(text: str, exponent_hex: str, modulus_hex: str) -> str:
 # ===========================================================================
 # 5. 网络检测器
 # ===========================================================================
+# 见 link_info()：psutil 的网卡枚举在个别驱动上会在 native 层崩溃（try/except
+# 抓不到，整个进程直接死）。所有枚举调用串行化，并且默认根本不走这条路。
+_LINK_LOCK = threading.Lock()
+
+
 class NetworkChecker:
     """物理链路检测 + 主动连通性探测 + Portal 指纹识别。"""
 
@@ -908,7 +939,7 @@ class NetworkChecker:
         if use_cache:
             now = time.monotonic()
             cached = getattr(self, "_link_cache", None)
-            ttl = float(self.cfg.get("network.link_cache_seconds", 3.0))
+            ttl = float(self.cfg.get("network.link_cache_seconds", 5.0))
             if cached and now - cached[0] < ttl:
                 return cached[1]
         info = self._link_info_uncached()
@@ -919,27 +950,43 @@ class NetworkChecker:
         return info
 
     def _link_info_uncached(self) -> LinkInfo:
-        info = LinkInfo()
-        if psutil is None:
-            # 没有 psutil 时退化：只要本机拿得到出口 IP 就认为链路可用
-            ip = self.local_outbound_ip()
-            if ip:
-                info.up = True
-                info.interfaces = {"<unknown>": [ip]}
-                info.primary_ip, info.primary_iface = ip, "<unknown>"
-            return info
+        """读链路信息。默认用"出口 IP"安全模式，不调用 psutil。
 
+        原因（已用 logs/crash.log 证实）：这台机器的网卡驱动会让
+        psutil.net_if_addrs 偶发 access violation —— 那是 native 崩溃，
+        Python 的 try/except 完全抓不到，进程会静默消失，休眠醒来后自然
+        就"没网也没人认证"。所以热路径只用 UDP socket 问出口 IP。
+        """
+        mode = str(self.cfg.get("network.adapter_enum", "safe") or "safe").lower()
+        if psutil is None or mode not in ("full", "all"):
+            return self._link_info_safe()
+        with _LINK_LOCK:
+            return self._link_info_full()
+
+    def _link_info_safe(self) -> LinkInfo:
+        """安全模式：只看"本机默认出口 IP"，完全不碰 psutil。
+
+        UDP connect 不会真的发包，只让系统按路由表挑源地址；
+        没有可用网卡 / DHCP 还没拿到地址时会失败，返回空 -> 链路不可用。
+        """
+        info = LinkInfo()
+        ip = self.local_outbound_ip()
+        if not ip:
+            return info
+        info.up = True
+        info.primary_ip = ip
+        info.primary_iface = "<outbound>"
+        info.interfaces = {"<outbound>": [ip]}
+        return info
+
+    def _link_info_full(self) -> LinkInfo:
+        info = LinkInfo()
         ignore = [s.lower() for s in (self.cfg.get("network.ignore_interfaces") or [])]
         # 枚举网卡偶尔会在 native 层崩（crash.log 里见过 psutil net_if_stats 的
         # access violation）。连续失败 3 次就暂时停用枚举，只用出口 IP 判定，
         # 避免在坏掉的接口上空转。
         if getattr(self, "_enum_fail_streak", 0) >= 3:
-            ip = self.local_outbound_ip()
-            if ip:
-                info.up, info.primary_ip = True, ip
-                info.interfaces = {"<fallback>": [ip]}
-                info.primary_iface = "<fallback>"
-            return info
+            return self._link_info_safe()
         try:
             stats = psutil.net_if_stats()
             addrs = psutil.net_if_addrs()
@@ -947,11 +994,7 @@ class NetworkChecker:
         except Exception as exc:
             self._enum_fail_streak = getattr(self, "_enum_fail_streak", 0) + 1
             LOG.debug("读取网卡信息失败(%s次): %s", self._enum_fail_streak, exc)
-            ip = self.local_outbound_ip()
-            if ip:
-                info.up, info.primary_ip = True, ip
-                info.primary_iface = "<fallback>"
-            return info
+            return self._link_info_safe()
 
         for name, st in stats.items():
             if not getattr(st, "isup", False):
@@ -972,6 +1015,9 @@ class NetworkChecker:
                 info.interfaces[name] = ips
 
         info.up = bool(info.interfaces)
+        if not info.up:
+            # 枚举结果和路由表打架时，以"出口 IP"为准，别误报断网
+            return self._link_info_safe()
         if info.up:
             outbound = self.local_outbound_ip()
             if outbound:
@@ -987,7 +1033,20 @@ class NetworkChecker:
 
     @staticmethod
     def local_outbound_ip() -> str:
-        """通过 UDP socket "连" 一个公网地址来获取本机默认出口 IP（不会真的发包）。"""
+        """获取本机默认出口 IP。
+
+        优先在**子进程**里问（见 _probe_outbound_ip_isolated）：socket 的创建
+        和 connect 在本机偶发 access violation，放在主进程里会直接把进程打死。
+        子进程崩溃时退回同进程调用（并计入失败次数，连续失败就暂时不试）。
+        """
+        isolated = NetworkChecker._probe_outbound_ip_isolated()
+        if isolated is not None:
+            return isolated
+        return NetworkChecker._probe_outbound_ip_inline()
+
+    @staticmethod
+    def _probe_outbound_ip_inline() -> str:
+        """在同进程里取出口 IP（可能是崩溃源，仅在隔离方案不可用时兜底）。"""
         sock = None
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -999,6 +1058,49 @@ class NetworkChecker:
         finally:
             if sock:
                 sock.close()
+
+    # 隔离查询结果缓存（子进程有 ~85ms 开销，巡检周期内没必要反复起）
+    _outbound_cache: Tuple[float, Optional[str]] = (0.0, None)
+
+    @staticmethod
+    def _probe_outbound_ip_isolated(timeout: float = 4.0) -> Optional[str]:
+        """在隔离子进程里取出口 IP。
+
+        返回 "" 表示"子进程正常执行且确实没有出口 IP"（比如网卡没起来）；
+        返回 None 表示"隔离方案不可用/子进程崩了"，调用方应自行兜底。
+        """
+        if platform.system() != "Windows":
+            return None
+        code = (
+            "import socket,sys\n"
+            "s=None\n"
+            "try:\n"
+            "    s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)\n"
+            "    s.settimeout(1.0)\n"
+            "    s.connect(('8.8.8.8',80))\n"
+            "    sys.stdout.write(s.getsockname()[0])\n"
+            "except Exception:\n"
+            "    sys.stdout.write('')\n"
+            "finally:\n"
+            "    try:\n"
+            "        s and s.close()\n"
+            "    except Exception:\n"
+            "        pass\n"
+        )
+        cached_ts, cached_val = NetworkChecker._outbound_cache
+        if cached_val is not None and time.monotonic() - cached_ts < 5.0:
+            return cached_val
+        try:
+            r = subprocess.run(
+                [sys.executable, "-c", code], capture_output=True, timeout=timeout,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except Exception:
+            return None
+        if r.returncode != 0:
+            return None                       # 子进程崩了（access violation 等）
+        val = (r.stdout or b"").decode("utf-8", "replace").strip()
+        NetworkChecker._outbound_cache = (time.monotonic(), val)
+        return val
 
     # ---- 网卡健康 ---------------------------------------------------------
     def stale_ipv4_interfaces(self, quiet_seconds: float = 120.0) -> List[Dict[str, str]]:
@@ -1126,7 +1228,13 @@ class NetworkChecker:
             res = self.probe_target(target, fetch_portal=False, timeout=(1.0, 1.5))
         except Exception:
             return "transient"
-        return "ok" if res.kind == "ok" else "portal"
+        if res.kind == "ok":
+            return "ok"
+        if res.kind == "portal":
+            return "portal"
+        # 连接超时/DNS 抖动也是 error —— 这**不**等于看到认证页，
+        # 别把"暂时没通"说成"被 Portal 拦截"（否则会提前结束抢跑窗口）。
+        return "transient"
 
     def probe_target(self, target: Dict[str, Any], fetch_portal: bool = True,
                      timeout: Optional[Tuple[float, float]] = None) -> ProbeResult:
@@ -1258,21 +1366,42 @@ class NetworkChecker:
 
         portal_result: Optional[ProbeResult] = None
         errors: List[ProbeResult] = []
-        for target in (self.cfg.get("detect.probe_targets") or []):
+        ok_results: List[ProbeResult] = []
+        targets = self.cfg.get("detect.probe_targets") or []
+        for target in targets:
             res = self.probe_target(target)
             status.probes.append({
                 "target": res.target, "kind": res.kind, "status": res.status_code,
                 "final_url": res.final_url, "elapsed_ms": res.elapsed_ms, "detail": res.detail,
             })
             if res.kind == "ok":
-                # 任意一个目标通过就认为"能上网"
-                status.state = NetState.INTERNET_OK
-                status.detail = f"探测通过: {res.target} ({res.elapsed_ms} ms)"
-                return status
+                ok_results.append(res)
             if res.kind == "portal" and portal_result is None:
                 portal_result = res
             if res.kind == "error":
                 errors.append(res)
+
+        # 判定"真的在线"：要求多数目标通过，而不是任意一个通过。
+        # 原因：睡眠唤醒后网关常处于半通状态（DNS 有缓存能解析个别域名、
+        # 或网关只放行个别目标），单点通过会让我们误报"网络正常"并停止认证，
+        # 表现就是"显示已连接但打不开网页"。
+        need = int(self.cfg.get("detect.min_ok_targets", 0) or 0)
+        if need <= 0:
+            # 默认：目标数 <= 2 时要求全部通过；>= 3 时要求过半（至少 2 个）
+            need = len(targets) if len(targets) <= 2 else max(2, (len(targets) + 1) // 2)
+        need = min(need, len(targets)) if targets else 0
+
+        if ok_results and len(ok_results) >= need:
+            best = ok_results[0]
+            status.state = NetState.INTERNET_OK
+            status.detail = f"探测通过: {best.target} ({best.elapsed_ms} ms)"
+            if len(ok_results) > 1:
+                status.detail += f" 等 {len(ok_results)} 项"
+            if portal_result is not None:
+                # 有目标被拦截、又有目标通过：最可能是半通/劫持，别当正常
+                LOG.debug("部分目标通过(%s/%s)、部分被判拦截，仍按在线处理",
+                          len(ok_results), len(targets))
+            return status
 
         if portal_result is not None:
             status.state = NetState.PORTAL_REQUIRED
@@ -1298,7 +1427,14 @@ class NetworkChecker:
             return status
 
         status.state = NetState.UNKNOWN
-        if errors:
+        if ok_results and len(ok_results) < need:
+            # 关键的"显示已连接但实际没网"场景：个别目标通、多数不通
+            status.detail = (f"仅 {len(ok_results)}/{len(targets)} 个探测目标通过"
+                             f"（需 {need} 个）：" +
+                             "; ".join(f"{e.target}({e.detail})" for e in errors[:3]))
+            if not self.dns_ok():
+                status.detail += " | DNS 解析失败"
+        elif errors:
             status.detail = "所有探测目标均失败: " + "; ".join(
                 f"{e.target}({e.detail})" for e in errors[:3]
             )
@@ -1329,6 +1465,8 @@ class AuthTrigger:
         # 账号密码被网关明确拒绝时（密码错误等），一段时间内不再自动尝试，
         # 避免反复登录把校园网账号锁掉。
         self._auth_disabled_until = 0.0
+        # 上一次锐捷直连登录是否"真的验证到联网"（gateway 说 success ≠ 能上网）
+        self.last_login_verified = False
 
     # ---- 自动点击引擎 -----------------------------------------------------
     def _get_autoclicker(self):
@@ -1518,7 +1656,7 @@ class AuthTrigger:
         return info if isinstance(info, dict) else {}
 
     def ruijie_login(self, status: NetStatus, verify_seconds: Optional[float] = None,
-                     assume_success: bool = False) -> bool:
+                     skip_verify: bool = False) -> bool:
         """锐捷 ePortal：直接 POST InterFace.do?method=login。
 
         复刻页面 doauthen() 的请求（含 RSA 密码加密），约 1 秒完成，
@@ -1526,8 +1664,10 @@ class AuthTrigger:
         后面还有 Selenium 自动点击兜底。
 
         verify_seconds: 覆盖"提交后等联网"的秒数（唤醒预认证时用短的）。
-        assume_success: 网关返回 success 就直接算成功（唤醒后 DNS 往往还没好）。
+        skip_verify: 只表示"网关已接受登录"，**不表示已联网**。调用方不得
+                     据此通知用户成功（唤醒抢跑用：刚醒时 DNS 还没好）。
         """
+        self.last_login_verified = False
         al = self.cfg.get("auth.auto_login") or {}
         if not al.get("enabled") or not al.get("username") or not al.get("password"):
             return False
@@ -1624,8 +1764,17 @@ class AuthTrigger:
             return False
 
         if "已在线" in text or "already online" in text.lower():
-            LOG.info("锐捷直连：网关提示账号已在线，视为已认证")
-            return True
+            # 网关说"已在线"≠真的能上网：会话可能挂在别的设备/旧 MAC 上，
+            # 账号被占着，实际流量照样被拦。必须实测一次再下结论。
+            wait = max(4.0, float(verify_seconds or 0.0))
+            LOG.info("锐捷直连：网关提示账号已在线，核实是否真的能上网（最多 %.0fs）...", wait)
+            if self._verify_online(wait):
+                LOG.info("锐捷直连：核实通过，网络已恢复")
+                self.last_login_verified = True
+                return True
+            LOG.warning("网关提示账号已在线，但实际仍无法上网 —— 会话很可能被其它设备"
+                        "（或旧 MAC）占用；需要先在那台设备上注销/下线")
+            return False
 
         if not re.search(r"""["']?result["']?\s*:\s*["']?success""", text):
             msg = re.search(r"""message\s*:\s*["']([^"']{0,120})""", text)
@@ -1639,21 +1788,34 @@ class AuthTrigger:
                 LOG.warning("锐捷直连登录未成功: HTTP %s %s", resp.status_code, detail)
             return False
 
-        if assume_success:
-            LOG.info("锐捷直连登录已被网关接受（唤醒预认证，不等 DNS 验证）")
+        if skip_verify:
+            LOG.info("锐捷直连登录已被网关接受（未验证，等探测确认是否真的能上网）")
             return True
 
         LOG.info("锐捷直连登录已提交（HTTP %s），等待网络恢复...", resp.status_code)
         timeout = (float(verify_seconds) if verify_seconds is not None
                    else min(float(al.get("verify_timeout", 25)), 12.0))
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            if self.checker.is_online():
-                LOG.info("锐捷直连登录成功，网络已恢复")
-                return True
-            time.sleep(1.0)
+        if self._verify_online(timeout):
+            LOG.info("锐捷直连登录成功，网络已恢复")
+            self.last_login_verified = True
+            return True
         LOG.warning("锐捷直连登录返回成功，但 %.0f 秒内仍未联网", timeout)
         return False
+
+    def _verify_online(self, timeout: float) -> bool:
+        """在 timeout 秒内反复轻量探测，确认"真的能上网"（不抓认证页）。"""
+        deadline = time.time() + max(0.0, float(timeout))
+
+        while True:
+            try:
+                if self.checker.is_online():
+                    return True
+            except Exception as exc:
+                LOG.debug("联网验证探测异常: %s", exc)
+            left = deadline - time.time()
+            if left <= 0:
+                return False
+            time.sleep(min(1.0, max(0.05, left)))
 
     def auto_login(self, status: NetStatus) -> bool:
         """尝试用配置的账号密码自动登录，然后验证是否真的联网成功。"""
@@ -2358,11 +2520,16 @@ class AutoPortalAuth:
         self._last_resume_wall = 0.0      # 最近一次唤醒（wall clock，用于容忍唤醒后的探测失败）
         self._wake_fast_left = 0          # 唤醒后还剩几次"快重试"（跨多轮休眠有效）
         self._wake_unknown_logged = False  # 唤醒后的"还没就绪"是否已提示过（避免刷屏）
-        self._wake_preauth_ok = False      # 本次唤醒的预认证是否已成功
+        self._wake_preauth_ok = False      # 本次唤醒的预认证是否已被网关接受
         self._wake_preauth_tries = 0       # 本次唤醒已尝试预认证的次数（用于抑制重复日志）
+        self._wake_preauth_ok_ts = 0.0     # 网关接受登录的时刻（8 秒还没通就再抢一次）
+        self._wake_rearm_done = False      # 本次唤醒是否已经"再抢一次"（避免反复提交）
         self._wake_level = "quick"         # 本次唤醒的抢跑档位：quick（短超时）-> normal
         self._wake_deadline = 0.0          # 本次唤醒的抢跑截止时刻（monotonic，兜底上限）
+        self._last_quick_probe_at = 0.0    # 上次唤醒快速探测的时刻（monotonic，节流用）
+        self._last_preauth_at = 0.0        # 上次提交预认证的时刻（monotonic，节流用）
         self._skip_tick = False            # 本轮跳过完整探测（抢跑窗口内 DNS 未就绪）
+        self._last_selfcheck = 0.0         # 上次"直接问 Portal 网关"的时刻（节流用）
         self._portal_cache_path = cfg.resolve_path(
             cfg.get("app.portal_cache_file", "data/last_portal.json"))
         self._portal_cache = self._load_portal_cache()
@@ -2405,11 +2572,22 @@ class AutoPortalAuth:
         LOG.info("=" * 68)
 
         # 启动时先跑一次，避免"开机后干等 30 秒"
-        self._tick(initial=True)
+        try:
+            self._tick(initial=True)
+        except Exception:
+            LOG.exception("首次巡检异常，继续运行（守护进程不会因此退出）")
 
         while not self.stop_event.is_set():
-            interval = self._next_interval()
-            self._sleep(interval)
+            # 心跳：每轮都刷新状态文件时间戳（即使本轮跳过完整探测）。
+            # 常驻看门狗靠它判断"进程还在干活"，还是已经卡死。
+            self._write_state_file()
+            interval = 5.0
+            try:
+                interval = self._next_interval()
+                self._sleep(interval)
+            except Exception:
+                LOG.exception("休眠/唤醒处理异常，1 秒后继续")
+                self.stop_event.wait(1.0)
             if self.stop_event.is_set():
                 break
             if self._skip_tick:
@@ -2417,7 +2595,12 @@ class AutoPortalAuth:
                 # 状态也不会变 —— 直接进入下一轮抢跑。
                 self._skip_tick = False
                 continue
-            self._tick()
+            try:
+                self._tick()
+            except Exception:
+                # 任何单轮巡检异常都不该让守护进程消失（否则醒来就没人认证了）
+                LOG.exception("巡检异常，%s 秒后重试", self._next_interval())
+                self.stop_event.wait(min(5.0, max(1.0, interval)))
 
         self._end_session("program_exit")
         self.stats.save(force=True)
@@ -2433,10 +2616,15 @@ class AutoPortalAuth:
             self.checker.fast_probe = True          # 探测超时压到 1s/2s
             self.checker.quick_auth = True          # 直连登录也只用 1s/1.5s
             verdict = "transient"
-            try:
-                verdict = self.checker.quick_probe_ip()
-            except Exception as exc:
-                LOG.debug("唤醒快速探测异常: %s", exc)
+            now = time.monotonic()
+            # 抢跑窗口每 0.25s 循环一次，但探测/登录不能按这个频率打：
+            # 探测 1.2s 一次已经够快；登录由 _wake_preauth 自己节流。
+            if now - self._last_quick_probe_at >= 1.2:
+                self._last_quick_probe_at = now
+                try:
+                    verdict = self.checker.quick_probe_ip()
+                except Exception as exc:
+                    LOG.debug("唤醒快速探测异常: %s", exc)
             if verdict == "ok":
                 LOG.info("唤醒后网络已可用")
                 self._end_wake_window()
@@ -2483,11 +2671,21 @@ class AutoPortalAuth:
                 self._wake_unknown_logged = False
                 self._wake_preauth_ok = False
                 self._wake_preauth_tries = 0
+                self._wake_preauth_ok_ts = 0.0
+                self._wake_rearm_done = False
+                self._last_preauth_at = 0.0
+                self._last_quick_probe_at = 0.0
+                self._skip_tick = False
                 self._wake_level = "quick"
                 self._wake_deadline = now + max(
                     3.0, float(self.cfg.get("monitor.wake_preauth_window", 25)))
                 self.checker.fast_probe = True
                 self.checker.quick_auth = True
+                # 唤醒瞬间先把状态标成"未验证"：网卡灯亮 ≠ 能上网。
+                # 认证/探测确认之前，state.json 不许再显示上次的 internet_ok，
+                # 否则用户（或别的程序）看到的就是"显示已连接、实际没网"。
+                self.status = NetStatus(state=NetState.UNKNOWN, detail="刚唤醒，正在抢认证")
+                self._write_state_file()
                 self.stats.add_wake_event()
                 self.notifier.on_wake()
                 # 休眠中断的会话在这里收尾（不是 Portal 空闲超时，别污染统计）
@@ -2524,9 +2722,7 @@ class AutoPortalAuth:
             return True
         if not self.cfg.get("monitor.wake_preauth", True):
             return False
-        retry = self._wake_preauth_tries > 0
-        self._wake_preauth_tries += 1
-        log = LOG.debug if retry else LOG.info
+        log = LOG.debug if self._wake_preauth_tries > 0 else LOG.info
         cache = self._portal_cache or {}
         url = str(cache.get("url") or "")
         if not url:
@@ -2553,6 +2749,15 @@ class AutoPortalAuth:
             self._end_wake_window()
             return False
 
+        # 节流：抢跑循环每 0.25s 一次，但登录请求不能按这个频率提交
+        # （会把网关刷爆，甚至触发风控/锁号）。默认 2 秒一次。
+        interval = max(0.5, float(self.cfg.get("monitor.wake_preauth_retry", 2.0)))
+        now_mono = time.monotonic()
+        if self._last_preauth_at and (now_mono - self._last_preauth_at) < interval:
+            return False
+        self._last_preauth_at = now_mono
+        self._wake_preauth_tries += 1
+
         status = NetStatus(
             state=NetState.PORTAL_REQUIRED, portal_url=url, local_ip=link.primary_ip,
             interface=link.primary_iface,
@@ -2564,14 +2769,15 @@ class AutoPortalAuth:
         try:
             # 注意：ruijie_login 是 AuthTrigger 的方法（之前这里写成 self.ruijie_login，
             # 直接 AttributeError 被 except 吞掉，抢跑从来没真正执行过）
-            ok = self.trigger.ruijie_login(status, verify_seconds=0.0, assume_success=True)
+            ok = self.trigger.ruijie_login(status, verify_seconds=0.0, skip_verify=True)
         finally:
             self.checker.quick_auth = quick_was
         if ok:
             self._wake_preauth_ok = True
-            self.trigger.successes += 1
-            self.stats.add_auth_result(True)
-            LOG.info("唤醒预认证成功（未等探测，浏览器不会先弹认证页）")
+            self._wake_preauth_ok_ts = time.time()
+            # 这里**不**记"认证成功"、也不发通知：网关接受 ≠ 真的能上网。
+            # 由下一轮真实探测确认后，_handle_online 才记成功并通知用户。
+            LOG.info("唤醒预认证：网关已接受登录，等待探测确认是否真的能上网")
             return True
         log("唤醒预认证未成功，继续快重试/正常探测")
         return False
@@ -2629,8 +2835,12 @@ class AutoPortalAuth:
     def _handle_online(self, status: NetStatus, prev: NetStatus, initial: bool) -> None:
         was_ok = prev.state is NetState.INTERNET_OK
         self._fail_streak = 0
-        self._wake_fast_left = 0          # 已恢复，不用再快重试
+        # 已恢复：结束抢跑窗口，清掉所有"唤醒中"的标记
+        self._end_wake_window()
         self.checker.fast_probe = False
+        self._wake_preauth_ok = False
+        self._wake_preauth_ok_ts = 0.0
+        self._wake_rearm_done = False
         self.trigger._last_browser_url = ""   # 已恢复，允许下次用浏览器
 
         if self.session_start is None:
@@ -2755,7 +2965,18 @@ class AutoPortalAuth:
                 LOG.info("唤醒后网络尚未就绪（%.1fs），快速重试中: %s", since_wake, status.detail)
             else:
                 LOG.debug("唤醒后重试仍未就绪（%.1fs）: %s", since_wake, status.detail)
-            # 探测要等 DNS，直连登录不用 —— 每轮都抢一次
+            # 网关说过"登录已接受"，但 8 秒还没网：会话可能没真正建立
+            # （旧 MAC 残留/网关抖动）。再抢一次，且每次唤醒只重抢一次。
+            rearm = max(3.0, float(self.cfg.get("monitor.wake_preauth_rearm", 8.0)))
+            if (self._wake_preauth_ok and not self._wake_rearm_done
+                    and self._wake_preauth_ok_ts
+                    and time.time() - self._wake_preauth_ok_ts >= rearm):
+                LOG.info("预认证已被网关接受但 %.0fs 仍未联网，重新提交一次登录", rearm)
+                self._wake_rearm_done = True
+                self._wake_preauth_ok = False
+                self._wake_preauth_tries = 0
+                self._last_preauth_at = 0.0
+            # 探测要等 DNS，直连登录不用 —— 每轮都抢一次（内部有节流）
             if self._wake_preauth():
                 # 网关已接受：下一轮只做一次短确认，别一直当"没就绪"
                 self._wake_deadline = min(
@@ -2766,6 +2987,65 @@ class AutoPortalAuth:
             self._end_session("unknown", status)
         else:
             LOG.info("状态未知: %s", status.detail)
+
+        # 关键自愈：超过唤醒容忍窗口仍然 unknown，不能就此"躺平"。
+        # 探测要 DNS，但 Portal 网关是 IP 直连 —— 直接问它就知道是
+        # "没认证"还是"真断网"。这是长时间睡眠后能自动恢复的关键一步。
+        if self._portal_selfcheck(status):
+            return
+
+    def _portal_selfcheck(self, status: NetStatus) -> bool:
+        """unknown 时的定向判定：直接问 Portal 网关，是"没认证"就立刻去认证。
+
+        只在探测持续失败时调用（有节流），避免无谓开销。
+        返回 True 表示已经转到 portal_required 并交给认证流程。
+        """
+        if not self.cfg.get("monitor.portal_selfcheck", True):
+            return False
+        interval = max(5.0, float(self.cfg.get("monitor.portal_selfcheck_interval", 20.0)))
+        now = time.monotonic()
+        if self._last_selfcheck and now - self._last_selfcheck < interval:
+            return False
+        self._last_selfcheck = now
+
+        link = self.checker.link_info()
+        if not link.up or not link.has_ip:
+            return False
+
+        # 优先用上次缓存的认证页（IP 直连，不需要 DNS）
+        cache = self._portal_cache or {}
+        candidate = str(cache.get("url") or "")
+        if candidate:
+            html = self.checker._fetch_portal_page(candidate)
+            if html:
+                LOG.info("主动探测认证页成功（%s），判定为需要认证", candidate.split("?")[0])
+                portal = NetStatus(
+                    state=NetState.PORTAL_REQUIRED, portal_url=candidate,
+                    local_ip=link.primary_ip, interface=link.primary_iface)
+                portal.fingerprint = guess_vendor(candidate, html)
+                portal.fingerprint.portal_url = candidate
+                self.status = portal
+                self._handle_portal(portal, status, False)
+                return True
+            LOG.debug("缓存的认证页已不可达: %s", candidate.split("?")[0])
+        else:
+            # 没有缓存：试着用一个常见网关地址探一下，成功就记下来
+            for guess in (self.cfg.get("monitor.portal_guess_urls") or []):
+                html = self.checker._fetch_portal_page(str(guess))
+                if html:
+                    LOG.info("探测到 Portal 网关: %s", str(guess).split("?")[0])
+                    self._save_portal_cache(
+                        NetStatus(state=NetState.PORTAL_REQUIRED, portal_url=str(guess),
+                                  local_ip=link.primary_ip), str(guess))
+                    portal = NetStatus(
+                        state=NetState.PORTAL_REQUIRED, portal_url=str(guess),
+                        local_ip=link.primary_ip, interface=link.primary_iface)
+                    portal.fingerprint = guess_vendor(str(guess), html)
+                    portal.fingerprint.portal_url = str(guess)
+                    self.status = portal
+                    self._handle_portal(portal, status, False)
+                    return True
+        return False
 
     def _end_session(self, reason: str, status: Optional[NetStatus] = None) -> None:
         if self.session_start is None:
@@ -2837,6 +3117,7 @@ class AutoPortalAuth:
             payload.update({
                 "version": __version__,
                 "pid": os.getpid(),
+                "heartbeat": now_iso(),
                 "session_seconds": round(time.time() - self.session_start, 1) if self.session_start else 0,
                 "last_ok": iso_from_ts(self.last_ok_ts),
                 "fail_streak": self._fail_streak,
@@ -3370,29 +3651,296 @@ def cmd_watchdog(cfg: Config, args) -> int:
         print("守护进程未运行。")
         return 1
 
-    args_list, pretty = autostart_command(cfg, args.config, python_exe=pick_daemon_python())
-    tries = max(1, int(getattr(args, "retries", 3) or 1))
+    pid = start_daemon(cfg, getattr(args, "config", None),
+                       retries=max(1, int(getattr(args, "retries", 3) or 1)))
+    return 0 if pid else 1
+
+
+def start_daemon(cfg: Config, config_path: Optional[str] = None,
+                 python_exe: Optional[str] = None, retries: int = 3,
+                 quiet: bool = False) -> Optional[int]:
+    """拉起守护进程，成功返回 PID，失败返回 None。
+
+    与看门狗/常驻守护共用：都必须是"分离进程 + pythonw"，这样拉起它的
+    看门狗退出/被关掉也不会把守护进程一起带走。
+    """
+    def say(msg: str, *args) -> None:
+        text = (msg % args) if args else msg
+        if not quiet:
+            print(text)
+        LOG.info(text)
+
+    args_list, pretty = autostart_command(
+        cfg, config_path, python_exe=python_exe or pick_daemon_python())
+    tries = max(1, int(retries or 1))
     for attempt in range(1, tries + 1):
-        print(f"[{attempt}/{tries}] 拉起守护进程: {pretty}")
+        say("[%d/%d] 拉起守护进程: %s", attempt, tries, pretty)
         try:
             kwargs = {"close_fds": True}
+            base_flags = 0
             if platform.system() == "Windows":
-                kwargs["creationflags"] = getattr(subprocess, "DETACHED_PROCESS", 0) | \
-                    getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-            subprocess.Popen(args_list, cwd=str(Path(__file__).resolve().parent),
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                             stdin=subprocess.DEVNULL, **kwargs)
+                base_flags = (getattr(subprocess, "DETACHED_PROCESS", 0)
+                              | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+            popen_args = (args_list,)
+            popen_kwargs = dict(cwd=str(Path(__file__).resolve().parent),
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                stdin=subprocess.DEVNULL, **kwargs)
+            # 计划任务会把本进程放进一个 Job 对象，子进程默认属于同一个 Job，
+            # Task Scheduler 会一直等它退出（任务长期停在 Running，唤醒触发失效）。
+            # 解决办法是带 CREATE_BREAKAWAY_FROM_JOB 脱离 Job —— 但当前进程
+            # 不在 Job 里时该标志会直接 WinError 5，所以必须"先试再退"。
+            BREAKAWAY = 0x01000000
+            if base_flags:
+                try:
+                    subprocess.Popen(*popen_args,
+                                     creationflags=base_flags | BREAKAWAY,
+                                     **popen_kwargs)
+                except OSError as exc:
+                    if getattr(exc, "winerror", None) == 5:
+                        LOG.debug("不支持 breakaway（不在 Job 中），改用普通分离方式")
+                        subprocess.Popen(*popen_args, creationflags=base_flags,
+                                         **popen_kwargs)
+                    else:
+                        raise
+            else:
+                subprocess.Popen(*popen_args, **popen_kwargs)
         except Exception as exc:
-            print(f"    启动失败: {exc}")
+            say("    启动失败: %s", exc)
         for _ in range(20):            # 最多等 6 秒
             time.sleep(0.3)
             pid = find_running_daemon(cfg)
             if pid:
-                print(f"    [OK] 已拉起 (pid={pid})")
-                return 0
+                say("    [OK] 已拉起 (pid=%s)", pid)
+                return pid
         time.sleep(1)
-    print("    [FAIL] 多次尝试仍未拉起，请手动运行 `python auto_portal_auth.py run` 查看报错。")
-    return 1
+    if not quiet:
+        print("    [FAIL] 多次尝试仍未拉起，请手动运行 `python auto_portal_auth.py run` 查看报错。")
+    LOG.error("多次尝试仍未拉起守护进程")
+    return None
+
+
+def _kill_pid(pid: int) -> bool:
+    """强制结束一个（可能已经卡死的）进程。"""
+    if pid <= 0:
+        return False
+    try:
+        if psutil is not None:
+            psutil.Process(pid).kill()
+            return True
+    except Exception as exc:
+        LOG.debug("psutil 结束进程 %s 失败: %s", pid, exc)
+    try:
+        if platform.system() == "Windows":
+            subprocess.run(["taskkill", "/F", "/PID", str(pid)],
+                           capture_output=True, timeout=10)
+        else:
+            os.kill(pid, signal.SIGKILL)
+        return True
+    except Exception as exc:
+        LOG.warning("结束进程 %s 失败: %s", pid, exc)
+        return False
+
+
+def daemon_heartbeat_age(cfg: Config) -> Optional[float]:
+    """守护进程最后一次心跳距今多少秒（读不到返回 None）。"""
+    path = cfg.resolve_path(cfg.get("app.state_file", "data/state.json"))
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    stamp = ""
+    if isinstance(data, dict):
+        stamp = str(data.get("heartbeat") or data.get("checked_at") or "")
+    if stamp:
+        try:
+            return max(0.0, time.time() - datetime.fromisoformat(stamp).timestamp())
+        except Exception:
+            pass
+    try:
+        return max(0.0, time.time() - path.stat().st_mtime)
+    except Exception:
+        return None
+
+
+def _watchdog_wait(seconds: float) -> bool:
+    """可被"休眠唤醒"提前打断的等待。返回 True 表示检测到系统刚从睡眠恢复。"""
+    wall0, mono0 = time.time(), time.monotonic()
+    while True:
+        time.sleep(min(0.5, max(0.05, seconds)))
+        wall = time.time() - wall0
+        mono = time.monotonic() - mono0
+        if wall - mono > 5.0:
+            return True
+        if mono >= seconds:
+            return False
+
+
+def cmd_watchdog_loop(cfg: Config, args) -> int:
+    """常驻看门狗（用户级，不需要管理员）。
+
+    为什么需要它：之前只提供了 Windows 计划任务，注册需要管理员权限，
+    普通用户装不上 —— 于是守护进程一旦被杀/崩溃，睡醒后就再也没人认证。
+    这个循环登录自启后常驻，每 N 秒检查一次：
+      * 进程不在了 -> 立刻拉起；
+      * 进程在但状态心跳很久没更新（卡死）-> 杀掉重拉；
+      * 系统刚休眠唤醒（墙钟跳变）-> 立即检查，不等下一个周期。
+    """
+    interval = float(getattr(args, "loop_interval", 0) or
+                     cfg.get("watchdog.interval", 60) or 60)
+    interval = max(5.0, interval)
+    stale = max(30.0, float(cfg.get("watchdog.stale_seconds", 180) or 180))
+    backoff = max(5.0, float(cfg.get("watchdog.restart_backoff", 30) or 30))
+    max_per_hour = max(1, int(cfg.get("watchdog.max_restarts_per_hour", 20) or 20))
+
+    lock = SingleInstance(cfg.resolve_path(
+        cfg.get("app.watchdog_lock_file", "data/watchdog.lock")))
+    if not lock.acquire():
+        return 1
+
+    LOG.info("常驻看门狗已启动 (pid=%s, 检查间隔=%.0fs, 卡死判定=%ss)",
+             os.getpid(), interval, stale)
+    last_spawn = 0.0
+    restarts: List[float] = []
+    try:
+        while True:
+            now = time.time()
+
+            # 1) 守护进程在不在
+            pid = find_running_daemon(cfg)
+
+            # 2) 在，但心跳停了 -> 卡死（比如 sleep 在 native 调用里）
+            if pid:
+                age = daemon_heartbeat_age(cfg)
+                if age is not None and age > stale:
+                    LOG.warning("守护进程疑似卡死 (pid=%s, 心跳已 %.0fs 未更新)，强制重启",
+                                pid, age)
+                    _kill_pid(pid)
+                    pid = None
+                else:
+                    LOG.debug("守护进程运行正常 (pid=%s, 心跳 %.0fs 前)", pid, age or 0)
+
+            # 3) 不在就拉起（带退避 + 每小时上限，避免死循环刷屏）
+            if not pid:
+                restarts = [t for t in restarts if now - t < 3600]
+                if len(restarts) >= max_per_hour:
+                    LOG.error("看门狗一小时内已重启 %d 次，暂停重启（请检查日志）",
+                              len(restarts))
+                elif now - last_spawn < backoff:
+                    LOG.debug("看门狗重启退避中（还需 %.0fs）", backoff - (now - last_spawn))
+                else:
+                    last_spawn = time.time()
+                    if start_daemon(cfg, getattr(args, "config", None),
+                                    retries=1, quiet=True):
+                        restarts.append(last_spawn)
+                    else:
+                        LOG.error("看门狗拉起守护进程失败，%.0fs 后重试", backoff)
+
+            jumped = _watchdog_wait(interval)
+            if jumped:
+                LOG.info("看门狗检测到系统刚唤醒，立即检查守护进程")
+    except KeyboardInterrupt:
+        LOG.info("看门狗收到中断，退出")
+    finally:
+        lock.release()
+    return 0
+
+
+def _watchdog_loop_run_value(cfg: Config, config_path: Optional[str],
+                             python_exe: Optional[str] = None) -> str:
+    """HKCU Run 里保存的命令行（pythonw，无黑框）。"""
+    exe = python_exe or pick_daemon_python()
+    if platform.system() == "Windows":
+        cand = Path(exe).with_name("pythonw.exe")
+        if cand.exists():
+            exe = str(cand)
+    parts = [exe, "-X", "utf8", str(Path(__file__).resolve()),
+             "watchdog", "--loop"]
+    if config_path:
+        parts += ["--config", str(Path(config_path).resolve())]
+    return " ".join(f'"{p}"' if " " in p else p for p in parts)
+
+
+def install_watchdog_loop(cfg: Config, config_path: Optional[str] = None,
+                          python_exe: Optional[str] = None,
+                          start_now: bool = True,
+                          quiet: bool = False) -> bool:
+    """把常驻看门狗写进 HKCU Run（登录自启），并立即启动一个。
+
+    这是不需要管理员权限的兜底方案；比"计划任务"弱一点（只在登录后启动），
+    但足以对付"守护进程被杀 / 崩溃 / 卡死"。
+    """
+    if platform.system() != "Windows":
+        if not quiet:
+            print("该命令目前只支持 Windows。")
+        return False
+    name = f"{APP_NAME}Watchdog"
+    value = _watchdog_loop_run_value(cfg, config_path, python_exe)
+    try:
+        import winreg
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                             r"Software\Microsoft\Windows\CurrentVersion\Run",
+                             0, winreg.KEY_SET_VALUE)
+        winreg.SetValueEx(key, name, 0, winreg.REG_SZ, value)
+        winreg.CloseKey(key)
+    except Exception as exc:
+        LOG.error("写入看门狗自启项失败: %s", exc)
+        if not quiet:
+            print(f"写入看门狗自启项失败: {exc}")
+        return False
+    LOG.info("已写入常驻看门狗自启项 HKCU\\...\\Run\\%s", name)
+    if not quiet:
+        print(f"已写入常驻看门狗自启项 HKCU\\...\\Run\\{name}")
+        print(f"  命令：{value}")
+
+    if start_now:
+        run_loop_now(cfg, config_path, python_exe, quiet=quiet)
+    return True
+
+
+def run_loop_now(cfg: Config, config_path: Optional[str],
+                 python_exe: Optional[str] = None, quiet: bool = False) -> None:
+    """立即后台启动一个 watch --loop（已有实例会自动退出）。"""
+    args_list = _watchdog_loop_run_value(cfg, config_path, python_exe)
+    # 用 shlex 拆分会破坏 Windows 路径引号规则，这里按"引号内不拆"手工切
+    parts = re.findall(r'"([^"]*)"|(\S+)', args_list)
+    argv = [a or b for a, b in parts]
+    try:
+        kwargs = {"close_fds": True}
+        if platform.system() == "Windows":
+            kwargs["creationflags"] = getattr(subprocess, "DETACHED_PROCESS", 0) | \
+                getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        subprocess.Popen(argv, cwd=str(Path(__file__).resolve().parent),
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         stdin=subprocess.DEVNULL, **kwargs)
+        if not quiet:
+            print("已在后台启动常驻看门狗。")
+    except Exception as exc:
+        LOG.error("启动常驻看门狗失败: %s", exc)
+        if not quiet:
+            print(f"启动常驻看门狗失败: {exc}")
+
+
+def uninstall_watchdog_loop(quiet: bool = False) -> bool:
+    if platform.system() != "Windows":
+        return False
+    name = f"{APP_NAME}Watchdog"
+    try:
+        import winreg
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                             r"Software\Microsoft\Windows\CurrentVersion\Run",
+                             0, winreg.KEY_SET_VALUE)
+        winreg.DeleteValue(key, name)
+        winreg.CloseKey(key)
+    except FileNotFoundError:
+        if not quiet:
+            print("没有找到常驻看门狗自启项（可能未安装）。")
+        return False
+    except Exception as exc:
+        LOG.error("删除看门狗自启项失败: %s", exc)
+        return False
+    if not quiet:
+        print(f"已删除常驻看门狗自启项 {name}（下次登录不再启动）")
+    return True
 
 
 def cmd_watchdog_install(cfg: Config, args) -> int:
@@ -3427,7 +3975,11 @@ def cmd_watchdog_install(cfg: Config, args) -> int:
             err = (r.stdout or "") + (r.stderr or "")
             print("创建计划任务失败：", err.strip())
             if "拒绝访问" in err or "Access is denied" in err:
-                print("提示：需要以管理员身份运行一次本命令。")
+                print("计划任务需要管理员权限，当前账户装不上。")
+                print("自动改用【不需要管理员】的常驻看门狗（HKCU 自启 + 后台循环）：")
+                ok = install_watchdog_loop(cfg, getattr(args, "config", None),
+                                           start_now=not getattr(args, "no_start", False))
+                return 0 if ok else 1
             return 1
         print(f"已创建计划任务 {name}")
         print(f"  触发：登录后 20 秒 / 每 {interval} 分钟 / 系统唤醒后 3 秒")
@@ -3725,9 +4277,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_wd.add_argument("--check", action="store_true", help="只检查，不拉起（未运行返回 1）")
     p_wd.add_argument("--retries", type=int, default=3, help="拉起失败的重试次数")
     p_wd.add_argument("--install", action="store_true",
-                      help="注册计划任务：登录 + 每 N 分钟 + 系统唤醒")
+                      help="注册计划任务：登录 + 每 N 分钟 + 系统唤醒（需要管理员）")
     p_wd.add_argument("--remove", action="store_true", help="删除计划任务")
     p_wd.add_argument("--interval", type=int, default=5, help="巡检间隔分钟数（默认 5）")
+    p_wd.add_argument("--loop", action="store_true",
+                      help="常驻模式：每 N 秒检查并拉起守护进程（不需要管理员）")
+    p_wd.add_argument("--loop-interval", type=float, default=0,
+                      help="常驻模式的检查间隔秒数（默认 60）")
+    p_wd.add_argument("--install-loop", action="store_true",
+                      help="安装常驻看门狗为登录自启（不需要管理员，推荐）")
+    p_wd.add_argument("--remove-loop", action="store_true", help="删除常驻看门狗自启项")
     p_wd.add_argument("--no-start", action="store_true", help="安装后不立即检查")
 
     sub.add_parser("install-extension", parents=[common],
@@ -3754,6 +4313,14 @@ def main(argv: Optional[List[str]] = None) -> int:
                 args.dry_run = False
             return cmd_fix_adapters(cfg, args)
         if command == "watchdog":
+            if getattr(args, "remove_loop", False):
+                return 0 if uninstall_watchdog_loop() else 1
+            if getattr(args, "install_loop", False):
+                ok = install_watchdog_loop(cfg, getattr(args, "config", None),
+                                           start_now=not getattr(args, "no_start", False))
+                return 0 if ok else 1
+            if getattr(args, "loop", False):
+                return cmd_watchdog_loop(cfg, args)
             if getattr(args, "remove", False) or getattr(args, "install", False):
                 return cmd_watchdog_install(cfg, args)
             return cmd_watchdog(cfg, args)
