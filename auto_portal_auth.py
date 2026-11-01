@@ -1655,6 +1655,62 @@ class AuthTrigger:
             return {}
         return info if isinstance(info, dict) else {}
 
+    def _ruijie_services(self, portal_url: str, query: str) -> List[Dict[str, str]]:
+        """调用 InterFace.do?method=getServices，拿可用的服务列表。
+
+        为什么必须单独问这个接口：静态 HTML 里没有 net_access_type，
+        它是页面 JS 通过 getServices 渲染出来的。服务名为空时网关会直接
+        返回 "ePortal上有多个服务,服务不能为空"，直连登录必然失败。
+
+        返回 [{'value': 'shu', 'name': '校园网'}]，按页面顺序。
+        """
+        url = urljoin(portal_url, "InterFace.do?method=getServices")
+        body = "queryString=" + _js_encode(_js_encode(query))
+        try:
+            resp = self.checker._session.post(
+                url, data=body.encode("utf-8"),
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                    "Referer": portal_url,
+                    "X-Requested-With": "XMLHttpRequest",
+                },
+                timeout=self.checker._timeout(), allow_redirects=False)
+            # 该接口不返回 charset，requests 会猜成 ISO-8859-1，中文变乱码。
+            # 实测响应就是 UTF-8，所以直接按 UTF-8 解，失败再退回原有逻辑。
+            try:
+                text = (resp.content or b"").decode("utf-8")
+            except UnicodeDecodeError:
+                text = self.checker._body_text(resp)
+            info = json.loads(text)
+        except Exception as exc:
+            LOG.debug("锐捷 getServices 请求失败: %s", exc)
+            return []
+        if not isinstance(info, dict):
+            return []
+        # 服务名藏在返回的 HTML 片段里： net_access_type ... value='shu'
+        blob = " ".join(str(v) for v in info.values() if isinstance(v, str))
+        services: List[Dict[str, str]] = []
+        seen = set()
+        for m in re.finditer(
+                r"""net_access_type[^>]*?value\s*=\s*["']([^"']+)["']""", blob):
+            val = m.group(1).strip()
+            if val and val not in seen:
+                seen.add(val)
+                services.append({"value": val, "name": ""})
+        for m in re.finditer(r"""selectService\(\s*["']([^"']+)["']""", blob):
+            val = m.group(1).strip()
+            if val and val not in seen:
+                seen.add(val)
+                services.append({"value": val, "name": ""})
+        if services:
+            # 用 selectService('shu','校园网',...) 补上可读名字
+            names = dict(re.findall(
+                r"""selectService\(\s*["']([^"']+)["']\s*,\s*["']([^"']*)["']""", blob))
+            for item in services:
+                item["name"] = names.get(item["value"], "")
+            LOG.debug("锐捷服务列表: %s", [i["value"] for i in services])
+        return services
+
     def ruijie_login(self, status: NetStatus, verify_seconds: Optional[float] = None,
                      skip_verify: bool = False) -> bool:
         """锐捷 ePortal：直接 POST InterFace.do?method=login。
@@ -1713,18 +1769,32 @@ class AuthTrigger:
                 LOG.debug("锐捷服务名从服务列表推断: %s", service)
         exponent = _input_value(html, "publicKeyExponent")
         modulus = _input_value(html, "publicKeyModulus")
-        if not (exponent and modulus):
-            # 页面静态 HTML 里公钥有时是空的（由 JS 调 pageInfo 后填入），
-            # 这时直接问接口要，别急着退回浏览器。
+        # 服务名和公钥经常**同时**为空：静态 HTML 只是个壳子，真正的值由
+        # 页面加载后调 InterFace.do?method=pageInfo 填进来。所以只要缺任一个
+        # 就去问一次接口 —— 之前只在公钥缺失时才问，导致服务名为空，
+        # 网关直接返回 "ePortal上有多个服务,服务不能为空"。
+        need_info = (not (exponent and modulus)) or (not service)
+        if need_info:
             info = self._ruijie_page_info(portal_url, query)
-            exponent = str(info.get("publicKeyExponent") or "")
-            modulus = str(info.get("publicKeyModulus") or "")
-            flag = str(info.get("passwordEncrypt") or "").lower()
-            if flag in ("true", "false"):
-                encrypt = flag
-            if info.get("validCodeUrl"):
-                LOG.info("锐捷认证页要求验证码，改用浏览器自动点击")
-                return False
+            if not (exponent and modulus):
+                exponent = str(info.get("publicKeyExponent") or "")
+                modulus = str(info.get("publicKeyModulus") or "")
+                flag = str(info.get("passwordEncrypt") or "").lower()
+                if flag in ("true", "false"):
+                    encrypt = flag
+                if info.get("validCodeUrl"):
+                    LOG.info("锐捷认证页要求验证码，改用浏览器自动点击")
+                    return False
+            if not service:
+                service = str(info.get("service") or "")
+                if not service:
+                    # 正确来源是 getServices 接口（页面 JS 就是靠它渲染下拉框）
+                    svcs = self._ruijie_services(portal_url, query)
+                    if svcs:
+                        service = svcs[0]["value"]
+                        LOG.info("锐捷服务名取自 getServices: %s（%s）",
+                                 service, svcs[0].get("name") or "")
+                        self._last_services = svcs
         if encrypt == "true":
             if not (exponent and modulus):
                 LOG.warning("锐捷页面未提供 RSA 公钥（pageInfo 也没有），改用浏览器自动点击")
@@ -1741,7 +1811,10 @@ class AuthTrigger:
         body = (
             f"userId={_js_encode(_js_encode(username))}"
             f"&password={_js_encode(_js_encode(encrypted))}"
-            f"&service={_js_encode(_js_encode(service))}"
+            # 参数名必须是 net_access_type（与页面隐藏域同名）。
+            # 之前写成 service=，网关会回 "ePortal上有多个服务,服务不能为空"，
+            # 直连登录永远失败 —— 这正是"唤醒后没有自动连上"的直接原因。
+            f"&net_access_type={_js_encode(_js_encode(service))}"
             f"&queryString={_js_encode(_js_encode(query))}"
             f"&operatorPwd=&operatorUserId=&validcode="
             f"&passwordEncrypt={_js_encode(_js_encode(encrypt))}"
@@ -2485,6 +2558,44 @@ class SingleInstance:
 # ===========================================================================
 # 11. 主应用：状态机 + 巡检循环
 # ===========================================================================
+class WakeFastThread(threading.Thread):
+    """独立线程：以 1 秒节奏盯着唤醒事件，醒来立刻抢连。
+
+    与主循环解耦的原因（11-01 事故）：主循环可能正卡在一次 30 秒的巡检等待
+    或一次慢探测里；更需要的是——若进程在睡眠中已被系统回收，主循环里做
+    任何优化都不会被执行。这个线程只做 poll + 一次直连登录，开销极小，
+    自身异常也只影响这个线程。
+    """
+
+    def __init__(self, owner):
+        super().__init__(name="wake-fast", daemon=True)
+        self.owner = owner
+        self._stop_flag = threading.Event()
+
+    def stop(self):
+        self._stop_flag.set()
+
+    def run(self):
+        LOG.debug("唤醒抢连线程已启动（1s 轮询）")
+        last = 0.0
+        while not self._stop_flag.wait(1.0):
+            try:
+                events = self.owner.watcher.poll()
+            except Exception as exc:
+                LOG.debug("唤醒线程 poll 异常: %s", exc)
+                continue
+            if "resume" not in events:
+                continue
+            now = time.monotonic()
+            if now - last < 15:
+                continue
+            last = now
+            try:
+                self.owner.on_wake_fast()
+            except Exception as exc:
+                LOG.warning("唤醒抢连异常: %s", exc)
+
+
 class AutoPortalAuth:
     STATE_REASONS = {
         NetState.INTERNET_OK: "internet_ok",
@@ -2530,6 +2641,7 @@ class AutoPortalAuth:
         self._last_preauth_at = 0.0        # 上次提交预认证的时刻（monotonic，节流用）
         self._skip_tick = False            # 本轮跳过完整探测（抢跑窗口内 DNS 未就绪）
         self._last_selfcheck = 0.0         # 上次"直接问 Portal 网关"的时刻（节流用）
+        self._wake_thread = None           # 独立唤醒抢连线程
         self._portal_cache_path = cfg.resolve_path(
             cfg.get("app.portal_cache_file", "data/last_portal.json"))
         self._portal_cache = self._load_portal_cache()
@@ -2571,6 +2683,13 @@ class AutoPortalAuth:
             LOG.warning("自动点击: 配置已开启但不可用 —— %s", clicker.unavailable_reason())
         LOG.info("=" * 68)
 
+        # 独立唤醒抢连线程：与主循环解耦，醒来第一时间动作
+        try:
+            self._wake_thread = WakeFastThread(self)
+            self._wake_thread.start()
+        except Exception as exc:
+            LOG.debug("唤醒抢连线程启动失败: %s", exc)
+
         # 启动时先跑一次，避免"开机后干等 30 秒"
         try:
             self._tick(initial=True)
@@ -2604,6 +2723,11 @@ class AutoPortalAuth:
 
         self._end_session("program_exit")
         self.stats.save(force=True)
+        try:
+            if self._wake_thread is not None:
+                self._wake_thread.stop()
+        except Exception:
+            pass
         self.watcher.stop()
         LOG.info("已退出。")
 
@@ -2698,6 +2822,37 @@ class AutoPortalAuth:
                 return
 
     # ---- 唤醒抢跑 ---------------------------------------------------------
+    def on_wake_fast(self) -> None:
+        """唤醒瞬间的立即动作（由 WakeFastThread 调用，不经过主循环）。
+
+        顺序特意是"先登录、后探测"：刚醒来 DNS 多半还没好，探测必失败；
+        但网关是 IP 直连，登录请求往往 1 秒内就被接受。
+        """
+        now = time.monotonic()
+        self._last_resume_mono = now
+        self._last_resume_wall = time.time()
+        self.after_wake = True
+        self._wake_fast_left = int(self.cfg.get("monitor.wake_fast_probes", 12))
+        self._wake_unknown_logged = False
+        self._wake_preauth_ok = False
+        self._wake_preauth_tries = 0
+        self._wake_rearm_done = False
+        self._wake_deadline = now + max(
+            3.0, float(self.cfg.get("monitor.wake_preauth_window", 25)))
+        self.checker.fast_probe = True
+        self.checker.quick_auth = True
+        try:
+            self.stats.add_wake_event()
+        except Exception:
+            pass
+        self._end_session("sleep")
+        grace = float(self.cfg.get("monitor.wake_grace", 1))
+        LOG.info("系统已唤醒（独立线程捕获），%ss 后抢连...", grace)
+        if grace > 0:
+            time.sleep(grace)
+        if self._wake_preauth():
+            LOG.info("唤醒抢连：网关已接受登录，等待探测确认")
+
     def _wake_window_active(self) -> bool:
         """是否仍在"唤醒后抢跑"窗口内（未被正常流程接管）。"""
         return (self._wake_deadline > 0.0 and self.after_wake
@@ -3607,20 +3762,39 @@ def pick_daemon_python() -> str:
         if key in seen:
             continue
         seen.add(key)
-        try:
-            exe_plain = path.with_name("python.exe") if path.name.startswith("pythonw") else path
-            if not exe_plain.exists():
-                continue
-            r = subprocess.run([str(exe_plain), "-c", "import selenium"],
-                               capture_output=True, timeout=15,
-                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-            if r.returncode == 0:
-                LOG.debug("看门狗选用解释器（selenium 可用）: %s", path)
-                return str(path)
-        except Exception:
+        # 只用"文件是否存在"判断，不执行子进程：
+        # 一是快，二是在受限环境里 subprocess 可能被策略拦截，
+        # 导致明明装了 selenium 也被误判成没装。
+        exe_plain = path.with_name("python.exe") if path.name.startswith("pythonw") else path
+        if not exe_plain.exists():
             continue
+        site = _selenium_site_dir(exe_plain)
+        if site:
+            LOG.debug("看门狗选用解释器（selenium 可用）: %s", path)
+            return str(path)
+
+    # 一个都没找到带 selenium 的：优先退回"非自身"的系统 Python（通常依赖更全），
+    # 而不是当前这个可能缺依赖的解释器。
+    for exe in candidates:
+        p2 = Path(exe)
+        if p2.exists() and str(p2).lower() != str(sys.executable).lower():
+            LOG.warning("未找到带 selenium 的解释器，退回: %s", p2)
+            return str(p2)
     LOG.warning("未找到装了 selenium 的解释器，退回当前解释器: %s", sys.executable)
     return sys.executable
+
+
+def _selenium_site_dir(exe_plain: Path) -> Optional[Path]:
+    """判断某个解释器是否装了 selenium：查它的 site-packages 目录。
+
+    不执行子进程，纯粹查文件，速度快且不受 subprocess 策略限制。
+    """
+    base = exe_plain.parent
+    candidates = list(base.glob("Lib/site-packages/selenium")) +         list(base.glob("Lib/site-packages/selenium-*.dist-info")) +         list(base.glob("lib/site-packages/selenium")) +         list(base.glob("lib/python*/site-packages/selenium"))
+    for c in candidates:
+        if c.exists():
+            return c
+    return None
 
 
 def find_running_daemon(cfg: Config) -> Optional[int]:

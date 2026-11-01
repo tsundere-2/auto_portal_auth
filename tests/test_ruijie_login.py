@@ -15,6 +15,7 @@ tests/test_ruijie_login.py —— 锐捷 ePortal 直连登录（不需要浏览�
 from __future__ import annotations
 
 import json
+import re
 import sys
 import tempfile
 import threading
@@ -156,7 +157,7 @@ class TestRuijieLogin(unittest.TestCase):
             self.assertTrue(fields["queryString"].startswith("wlanuserip%3D"), fields["queryString"])
             self.assertEqual(fields["passwordEncrypt"], "true")
             # 服务名来自页面隐藏域 net_access_type（真实页面是 "shu"）
-            self.assertEqual(fields["service"], "shu")
+            self.assertEqual(fields["net_access_type"], "shu")
             # 密码是 256 位十六进制密文，且绝对不能出现明文
             self.assertRegex(fields["password"], r"^[0-9a-f]{256}$")
             self.assertNotIn("S3cret", body)
@@ -245,7 +246,7 @@ class TestRuijieLoginPageInfo(unittest.TestCase):
             self.assertIn(("/eportal/InterFace.do", "method=pageInfo"), _PageInfoHandler.paths)
             fields = dict(urllib.parse.parse_qsl(_PageInfoHandler.login_body,
                                                  keep_blank_values=True))
-            self.assertEqual(fields["service"], "shu")
+            self.assertEqual(fields["net_access_type"], "shu")
             self.assertEqual(fields["passwordEncrypt"], "true")
             # 密文必须是用 pageInfo 给的公钥算出来的
             self.assertEqual(fields["password"], app.ruijie_rsa_encrypt(
@@ -612,3 +613,148 @@ class TestConnectedButNoNet(unittest.TestCase):
         auth._handle_unknown(offline, prev)
         self.assertEqual(len(handled), 1, "应主动判定为需要认证并交给认证流程")
         self.assertIn("eportal", handled[0])
+
+
+class TestWakeFastThread(unittest.TestCase):
+    """独立唤醒线程：不依赖主循环节奏，收到 resume 就立刻抢连。
+
+    11-01 事故的关键教训：主循环可能不在（进程已死）或卡在一次长等待里，
+    所以唤醒动作必须由一个独立的 1 秒节奏线程承担。
+    """
+
+    def test_thread_triggers_preauth_on_resume(self):
+        tmp = Path(tempfile.mkdtemp(prefix="apa-wt-"))
+        cfg = Config(data={
+            "app": {"portal_cache_file": "p.json", "stats_file": "s.json",
+                    "state_file": "st.json"},
+            "stats": {"enabled": False},
+            "monitor": {"wake_grace": 0, "wake_preauth_window": 5},
+            "auth": {"auto_login": {"enabled": True, "username": "u", "password": "p"}},
+        }, path=tmp / "c.yaml")
+        (tmp / "p.json").write_text(json.dumps({
+            "url": TestWakePreauth.PORTAL, "vendor": "ruijie",
+            "ip": "59.79.4.243", "saved_at": "x"}), encoding="utf-8")
+
+        auth = app.AutoPortalAuth(cfg)
+        auth.checker.link_info = lambda use_cache=True: app.LinkInfo(
+            up=True, interfaces={"<outbound>": ["59.79.4.243"]},
+            primary_ip="59.79.4.243", primary_iface="<outbound>")
+        calls = []
+        auth.trigger.ruijie_login = lambda status, **kw: calls.append(kw) or True
+
+        # 伪造 watcher：只报一次 resume
+        budget = {"n": 1}
+
+        class W:
+            def poll(self_inner):
+                if budget["n"] > 0:
+                    budget["n"] -= 1
+                    return ["resume"]
+                return []
+
+        auth.watcher = W()
+        th = app.WakeFastThread(auth)
+        th.start()
+        deadline = time.time() + 6
+        while time.time() < deadline and not calls:
+            time.sleep(0.1)
+        th.stop()
+        th.join(timeout=2)
+
+        self.assertTrue(calls, "独立线程应在收到 resume 后立即抢连")
+        self.assertTrue(auth.after_wake)
+        self.assertTrue(auth._wake_window_active(), "抢跑窗口应已打开")
+
+
+class _MultiServiceHandler(BaseHTTPRequestHandler):
+    """模拟真实锐捷"多服务"网关。
+
+    关键点（11-01 实测复现）：
+      * 静态 HTML 里 net_access_type / 公钥都是空的；
+      * pageInfo 只给公钥，**不给服务名**；
+      * 服务名只能从 getServices 返回的 HTML 片段里抠；
+      * 不带服务名登录 -> {"result":"fail","message":"ePortal上有多个服务,服务不能为空"}
+    """
+
+    logins: list = []
+
+    def log_message(self, *a):
+        pass
+
+    def _send(self, payload: bytes, ctype="text/html; charset=utf-8"):
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def do_GET(self):
+        html = """<html><body><form>
+<input id="publicKeyExponent" value="">
+<input id="publicKeyModulus" value="">
+<input id="passwordEncrypt" value="true" type="hidden">
+</form></body></html>"""
+        self._send(html.encode("utf-8"))
+
+    def do_POST(self):
+        parsed = urllib.parse.urlparse(self.path)
+        n = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(n).decode("utf-8")
+        if parsed.query == "method=pageInfo":
+            payload = json.dumps({
+                "passwordEncrypt": "true",
+                "publicKeyExponent": EXPONENT,
+                "publicKeyModulus": MODULUS,
+                "validCodeUrl": "",
+                "prefixValue": "shdx",
+            }).encode("utf-8")
+            self._send(payload, "application/json")
+            return
+        if parsed.query == "method=getServices":
+            svc = json.dumps({
+                "defaultService": '<div id="selectDisname">校园网</div>'
+                                  '<input name="net_access_type" id="net_access_type" '
+                                  "value='shu' type=\"hidden\"/>",
+                "serviceContent": "<div onclick=\"selectService('shu','校园网','0')\"></div>",
+            }, ensure_ascii=False).encode("utf-8")
+            self._send(svc, "application/json")
+            return
+        # login
+        type(self).logins.append(body)
+        m = re.search(r"net_access_type=([^&]*)", body)
+        if not m or not m.group(1).strip():
+            payload = json.dumps({"result": "fail",
+                                  "message": "ePortal上有多个服务,服务不能为空"}).encode("utf-8")
+        else:
+            payload = b'{"result":"success","message":""}'
+        self._send(payload, "application/json")
+
+
+class TestMultiServiceLogin(unittest.TestCase):
+    """服务名必须从 getServices 取，否则网关拒绝登录。"""
+
+    def test_service_name_from_getservices(self):
+        _MultiServiceHandler.logins = []
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), _MultiServiceHandler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        base = f"http://127.0.0.1:{srv.server_address[1]}"
+        portal = base + "/eportal/index.jsp?wlanuserip=59.79.4.243&mac=c85309dcd933"
+        try:
+            cfg = Config(data={
+                "auth": {"auto_login": {"enabled": True, "username": "u", "password": "p"}},
+            }, path=Path(tempfile.mkdtemp()) / "c.yaml")
+            checker = _FakeChecker(base)
+            trigger = AuthTrigger(cfg, checker)
+            status = NetStatus(state=app.NetState.PORTAL_REQUIRED, portal_url=portal,
+                               fingerprint=Fingerprint(vendor="ruijie", confidence=1.0,
+                                                       portal_url=portal))
+            # 用 skip_verify 跳过"提交后等联网"（假服务端不会真的放行）
+            self.assertTrue(trigger.ruijie_login(status, verify_seconds=0.0,
+                                                 skip_verify=True),
+                            "带服务名应被网关接受")
+            self.assertEqual(len(_MultiServiceHandler.logins), 1)
+            body = _MultiServiceHandler.logins[0]
+            self.assertIn("shu", body, "必须带上 getServices 取回的服务名")
+        finally:
+            srv.shutdown()
+            srv.server_close()
