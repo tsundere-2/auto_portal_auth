@@ -125,7 +125,10 @@ auth:
 # ---------------------------------------------------------------------------
 browser_automation:
   enabled: true
-  engine: auto                    # auto=自动 | selenium | off=关闭
+  engine: auto                    # auto | cdp | selenium | off
+                                  #   auto/cdp 用 CDP 调试协议，**不需要 msedgedriver**，
+                                  #   所以 Edge 自动升级也不会失效（推荐）
+                                  #   selenium 需要版本完全匹配的驱动                    # auto=自动 | selenium | off=关闭
   browser: auto                   # auto | edge | chrome
   binary: ""                      # 自定义浏览器路径（留空自动查找 Edge/Chrome）
   headless: auto                  # auto=先无头、失败再显示窗口 | true | false

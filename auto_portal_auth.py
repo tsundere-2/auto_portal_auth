@@ -92,6 +92,11 @@ except ImportError:  # pragma: no cover
 
 # 自动点击引擎（可选组件：缺 selenium 时模块仍可导入，只是不可用）
 try:
+    import portal_cdp
+except Exception:  # pragma: no cover
+    portal_cdp = None
+
+try:
     import portal_autoclick
 except Exception:  # pragma: no cover
     portal_autoclick = None
@@ -233,11 +238,15 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     # -------------------------------------------------------------------
     "browser_automation": {
         "enabled": True,
-        "engine": "auto",              # auto | selenium | off
+        "engine": "auto",              # auto | cdp | selenium | off
+                                       #   auto = 优先 cdp（免驱动），不可用再 selenium
+                                       #   cdp  = 只用 CDP（Edge 升级不会失效，推荐）
         "browser": "auto",             # auto | edge | chrome
         "binary": "",                  # 自定义浏览器可执行文件路径（留空自动查找）
         "headless": "auto",            # auto=先无头，失败再显示窗口 | true | false
         "timeout": 35,                 # 一次点击+验证的总预算（秒）
+        "cdp_port": 0,                 # CDP 调试端口，0=随机（避免和别的工具撞车）
+        "cdp_start_timeout": 20,       # 等调试端口就绪的上限（秒）
         "page_load_timeout": 20,
         "verify_interval": 3,          # 轮询"是否已联网"的间隔
         "click_delay": 0.8,            # 点击后等待页面反应
@@ -1448,6 +1457,31 @@ class NetworkChecker:
 # ===========================================================================
 # 6. 认证触发器（打开浏览器 / HTTP 戳 / 自动填表登录）
 # ===========================================================================
+def _as_autoclick_result(raw) -> Optional["portal_autoclick.AutoclickResult"]:
+    """把不同引擎的返回值统一成 AutoclickResult 风格的轻量对象。"""
+    if raw is None:
+        return None
+    if portal_autoclick is not None and isinstance(raw, portal_autoclick.AutoclickResult):
+        return raw
+
+    class _R:
+        pass
+
+    r = _R()
+    get = raw.get if isinstance(raw, dict) else (lambda k, d=None: getattr(raw, k, d))
+    r.success = bool(get("success", False))
+    r.clicked = bool(get("clicked", False))
+    r.clicked_text = str(get("clicked_text", "") or "")
+    r.score = float(get("score", 0.0) or 0.0)
+    r.headless = bool(get("headless", True))
+    r.error = str(get("error", "") or "")
+    r.duration = float(get("elapsed", 0.0) or 0.0)
+    r.checkboxes = list(get("checkboxes", []) or [])
+    r.screenshot = str(get("screenshot", "") or "")
+    r.html_dump = str(get("html_dump", "") or "")
+    return r
+
+
 class AuthTrigger:
     def __init__(self, cfg: Config, checker: NetworkChecker, stats: Optional["StatsStore"] = None):
         self.cfg = cfg
@@ -1470,15 +1504,45 @@ class AuthTrigger:
 
     # ---- 自动点击引擎 -----------------------------------------------------
     def _get_autoclicker(self):
-        if portal_autoclick is None or self._autoclick_init_failed:
-            return None
+        """选自动点击引擎：cdp（默认，免驱动）> selenium > 无。
+
+        为什么默认用 CDP：Selenium 必须配套版本完全匹配的 msedgedriver，
+        而 Edge 会自动升级（实测浏览器 157、缓存驱动 155），一升级兜底就失效；
+        需要认证的网络里又下载不了新驱动，形成死循环。CDP 是浏览器内置协议，
+        不依赖驱动，Edge 升级多少次都能用。
+        """
         if not self.cfg.get("browser_automation.enabled", True):
             return None
-        if str(self.cfg.get("browser_automation.engine", "auto")).lower() == "off":
+        engine = str(self.cfg.get("browser_automation.engine", "auto")).lower()
+        if engine == "off":
             return None
-        if self.autoclicker is None:
+
+        # 1) CDP 引擎（免驱动）
+        if engine in ("auto", "cdp") and self.autoclicker is None:
+            if portal_cdp is not None:
+                try:
+                    candidate = portal_cdp.CDPClicker(self.cfg, LOG)
+                    if candidate.available:
+                        self.autoclicker = candidate
+                        LOG.debug("自动点击引擎: cdp（免驱动）")
+                        return self.autoclicker
+                    if engine == "cdp":
+                        LOG.warning("CDP 引擎不可用: %s", candidate.unavailable_reason())
+                        return None
+                except Exception as exc:
+                    LOG.debug("CDP 引擎初始化失败: %s", exc)
+                    if engine == "cdp":
+                        return None
+
+        # 2) Selenium 引擎（需匹配驱动）
+        if engine in ("auto", "selenium") and self.autoclicker is None:
+            if portal_autoclick is None or self._autoclick_init_failed:
+                return None
             try:
-                self.autoclicker = portal_autoclick.PortalAutoClicker(self.cfg)
+                candidate = portal_autoclick.PortalAutoClicker(self.cfg)
+                if engine == "selenium" or candidate.available:
+                    self.autoclicker = candidate
+                    LOG.debug("自动点击引擎: selenium")
             except Exception as exc:
                 LOG.warning("初始化自动点击引擎失败，将退回打开浏览器: %s", exc)
                 self._autoclick_init_failed = True
@@ -1502,14 +1566,39 @@ class AuthTrigger:
 
         result = None
         try:
-            result = clicker.click(
+            raw = clicker.click(
                 status.portal_url,
                 verify=lambda: self.checker.is_online(),
             )
         except Exception as exc:
             LOG.warning("自动点击过程异常: %s", exc)
+            raw = None
+        # CDP 引擎返回 dict，Selenium 引擎返回 AutoclickResult 对象，统一成对象
+        result = _as_autoclick_result(raw)
 
         ok = bool(result and result.success)
+
+        # CDP 失败（常见于某些 Portal 页让渲染进程无响应）时，
+        # 若配置允许就再用 Selenium 试一次 —— 两条路互补，提高成功率。
+        if (not ok and getattr(clicker, "name", "") == "cdp"
+                and str(self.cfg.get("browser_automation.engine", "auto")).lower() == "auto"
+                and portal_autoclick is not None):
+            LOG.debug("CDP 未成功，回退 Selenium 再试一次")
+            try:
+                fb = portal_autoclick.PortalAutoClicker(self.cfg)
+                if fb.available:
+                    raw2 = fb.click(status.portal_url,
+                                    verify=lambda: self.checker.is_online())
+                    r2 = _as_autoclick_result(raw2)
+                    if r2 and r2.success:
+                        result = r2
+                        ok = True
+                        LOG.info("Selenium 回退成功")
+                    else:
+                        LOG.debug("Selenium 回退也未成功")
+            except Exception as exc:
+                LOG.debug("Selenium 回退异常: %s", exc)
+
         if self.stats:
             try:
                 self.stats.add_autoclick_result(ok)

@@ -758,3 +758,45 @@ class TestMultiServiceLogin(unittest.TestCase):
         finally:
             srv.shutdown()
             srv.server_close()
+
+
+class TestCDPEngine(unittest.TestCase):
+    """CDP 引擎（免驱动）—— 解决 Edge 自动升级导致驱动失配的问题。
+
+    背景（实测）：Edge 升到 157，Selenium 缓存驱动只有 155，
+    报 "This version of Microsoft Edge WebDriver only supports 155"，
+    浏览器兜底彻底失效；而认证前又下载不了新驱动。
+    """
+
+    def test_engine_prefers_cdp(self):
+        """engine=auto 时应优先选 CDP 引擎（免驱动）。"""
+        import portal_cdp
+        tmp = Path(tempfile.mkdtemp(prefix="cdp-"))
+        cfg = Config(data={
+            "app": {"stats_file": "s.json", "state_file": "st.json",
+                    "portal_cache_file": "p.json"},
+            "stats": {"enabled": False},
+            "browser_automation": {"enabled": True, "engine": "auto"},
+        }, path=tmp / "c.yaml")
+        trigger = app.AuthTrigger(cfg, app.NetworkChecker(cfg))
+        if not portal_cdp.find_edge():
+            self.skipTest("未安装 Edge")
+        clicker = trigger._get_autoclicker()
+        self.assertIsNotNone(clicker)
+        self.assertIsInstance(clicker, portal_cdp.CDPClicker)
+
+    def test_selenium_js_adapter(self):
+        """Selenium 风格的 JS（结尾 arguments[0]）必须能被改成可求值表达式。"""
+        import portal_cdp
+        js = "return (function (x) { return x + 1; })(arguments[0]);"
+        adapted = portal_cdp._adapt_selenium_js(js, 41)
+        self.assertFalse(adapted.lstrip().startswith("return "),
+                         "外层的 return 必须去掉（CDP 直接求值）")
+        self.assertNotIn("arguments[", adapted)
+        self.assertIn("41", adapted)
+
+    def test_cdp_client_imports_without_thirdparty(self):
+        """CDP 客户端只用标准库，不引入 websocket 第三方包。"""
+        import cdp_client
+        self.assertTrue(hasattr(cdp_client, "Browser"))
+        self.assertTrue(hasattr(cdp_client, "CDPSession"))
